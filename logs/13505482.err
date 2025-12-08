@@ -1,0 +1,12 @@
+Loading module 'conda-gcc/11.2.0'
+Loading module 'python/3.10'
+Loading module 'cuda/12.2.0'
+Loading module 'gcc/9.2.0'
+
+Loading [1mcuda/12.2.0[22m
+  [94mLoading requirement[0m: gcc/9.2.0
+Loading module 'openmpi/4.1.1rc1'
+
+Loading [1mmesa/20.2.1[22m
+  [94mLoading requirement[0m: openmpi/4.1.1rc1
+/share/apps/NYUAD5/miniconda/3-4.11.0/etc/conda/activate.d/libblas_mkl_activate.sh: line 1: MKL_INTERFACE_LAYER: unbound variable
