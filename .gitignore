@@ -4,6 +4,13 @@ __pycache__/
 *.pyd
 *.log
 *.swp
+*.pt
+*.out
+*.err
 .DS_Store
 .vscode/
-.logs/
+logs/
+experiments/meta-world/runs/
+experiments/meta-world/agents/
+experiments/meta-world/models/__pycache__/
+experiments/meta-world/wandb/
