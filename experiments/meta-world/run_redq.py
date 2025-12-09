@@ -91,6 +91,12 @@ class Args:
     """pool size"""
     encoder_from_base: bool = False
     """load encoder from base_dir"""
+    num_q_nets: int = 10
+    """Number of Q-networks in the ensemble (REDQ)"""
+    q_target_subset_size: int = 2
+    """Number of Q-networks to randomly select for target computation (REDQ)"""
+    utd_ratio: int = 20
+    """Update-to-data ratio: number of gradient updates per environment step (REDQ)"""
 
 def make_env(task_id):
     def thunk():
@@ -342,14 +348,15 @@ if __name__ == "__main__":
             ).to(device)
         
     actor = Actor(envs, model).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
+    # REDQ: Create ensemble of N Q-networks
+    q_nets = [SoftQNetwork(envs).to(device) for _ in range(args.num_q_nets)]
+    q_targets = [SoftQNetwork(envs).to(device) for _ in range(args.num_q_nets)]
+    # Initialize target networks with main network weights
+    for q_target in q_targets:
+        q_target.load_state_dict(q_nets[0].state_dict())
+    # REDQ: Optimizer for all Q-networks
     q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
+        [p for q_net in q_nets for p in q_net.parameters()], lr=args.q_lr
     )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
     if args.model_type == 'cbpnet':
@@ -434,115 +441,127 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
+        # REDQ: UTD ratio - perform multiple updates per environment step
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
-                )
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_state_log_pi
-                )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
-
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
-
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
-
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
-
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    if args.model_type == "packnet":
-                        if global_step >= packnet_retrain_start:
-                            # can be called multiple times, only the first counts
-                            actor.model.start_retraining()
-                        actor.model.before_update()
-                    actor_optimizer.step()
-
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (
-                            -log_alpha.exp() * (log_pi + target_entropy)
-                        ).mean()
-
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
-
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
+            for utd_iter in range(args.utd_ratio):
+                data = rb.sample(args.batch_size)
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(
+                        data.next_observations
                     )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    # REDQ: Randomly select subset of Q-networks for target computation
+                    selected_indices = np.random.choice(
+                        args.num_q_nets, args.q_target_subset_size, replace=False
                     )
+                    q_next_targets = [
+                        q_targets[i](data.next_observations, next_state_actions)
+                        for i in selected_indices
+                    ]
+                    # Take minimum of selected Q-networks
+                    min_qf_next_target = (
+                        torch.min(torch.stack(q_next_targets), dim=0)[0]
+                        - alpha * next_state_log_pi
+                    )
+                    next_q_value = data.rewards.flatten() + (
+                        1 - data.dones.flatten()
+                    ) * args.gamma * (min_qf_next_target).view(-1)
 
-            if global_step % 100 == 0:
-                writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
-                )
-                writer.add_scalar(
-                    "losses/qf2_values", qf2_a_values.mean().item(), global_step
-                )
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
-                # print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
-                if args.autotune:
+                # REDQ: Compute loss for all Q-networks in ensemble
+                q_losses = []
+                q_a_values_list = []
+                for q_net in q_nets:
+                    q_a_values = q_net(data.observations, data.actions).view(-1)
+                    q_loss = F.mse_loss(q_a_values, next_q_value)
+                    q_losses.append(q_loss)
+                    q_a_values_list.append(q_a_values)
+                qf_loss = sum(q_losses)
+
+                # optimize the model
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
+
+                if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+                    for _ in range(
+                        args.policy_frequency
+                    ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                        pi, log_pi, _ = actor.get_action(data.observations)
+                        # REDQ: Use all Q-networks for actor loss (take minimum)
+                        q_pi_values = [q_net(data.observations, pi) for q_net in q_nets]
+                        min_qf_pi = torch.min(torch.stack(q_pi_values), dim=0)[0]
+                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        if args.model_type == "packnet":
+                            if global_step >= packnet_retrain_start:
+                                # can be called multiple times, only the first counts
+                                actor.model.start_retraining()
+                            actor.model.before_update()
+                        actor_optimizer.step()
+
+                        if args.autotune:
+                            with torch.no_grad():
+                                _, log_pi, _ = actor.get_action(data.observations)
+                            alpha_loss = (
+                                -log_alpha.exp() * (log_pi + target_entropy)
+                            ).mean()
+
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = log_alpha.exp().item()
+
+                # REDQ: update all target networks
+                if global_step % args.target_network_frequency == 0:
+                    for q_net, q_target in zip(q_nets, q_targets):
+                        for param, target_param in zip(
+                            q_net.parameters(), q_target.parameters()
+                        ):
+                            target_param.data.copy_(
+                                args.tau * param.data
+                                + (1 - args.tau) * target_param.data
+                            )
+
+                # REDQ: Log aggregate statistics for ensemble of Q-networks (only on first UTD iteration when logging)
+                if global_step % 100 == 0 and utd_iter == 0:
+                    q_values_mean = torch.stack(q_a_values_list).mean().item()
+                    q_values_std = torch.stack(q_a_values_list).std().item()
+                    q_loss_mean = sum(q_losses).item() / len(q_losses)
+                    writer.add_scalar("losses/qf_mean_values", q_values_mean, global_step)
+                    writer.add_scalar("losses/qf_std_values", q_values_std, global_step)
+                    writer.add_scalar("losses/qf_loss", q_loss_mean, global_step)
+                    writer.add_scalar("losses/alpha", alpha, global_step)
+                    # print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar(
-                        "losses/alpha_loss", alpha_loss.item(), global_step
+                        "charts/SPS",
+                        int(global_step / (time.time() - start_time)),
+                        global_step,
                     )
-                if args.track:
-                    log_dict = {
-                        "losses/qf1_values": qf1_a_values.mean().item(),
-                        "losses/qf2_values": qf2_a_values.mean().item(),
-                        "losses/qf1_loss": qf1_loss.item(),
-                        "losses/qf2_loss": qf2_loss.item(),
-                        "losses/qf_loss": qf_loss.item() / 2.0,
-                        "losses/actor_loss": actor_loss.item(),
-                        "losses/alpha": alpha,
-                        "charts/SPS": int(global_step / (time.time() - start_time)),
-                    }
+                    if args.track:
+                        log_dict = {
+                            "losses/qf_mean_values": q_values_mean,
+                            "losses/qf_std_values": q_values_std,
+                            "losses/qf_loss": q_loss_mean,
+                            "losses/alpha": alpha,
+                            "charts/SPS": int(global_step / (time.time() - start_time)),
+                        }
+                        wandb.log(log_dict, step=global_step)
+                
+                # Log actor_loss and alpha_loss only when policy is updated
+                if global_step % args.policy_frequency == 0 and global_step % 100 == 0 and utd_iter == 0:
+                    writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                     if args.autotune:
-                        log_dict["losses/alpha_loss"] = alpha_loss.item()
-                    wandb.log(log_dict, step=global_step)
+                        writer.add_scalar(
+                            "losses/alpha_loss", alpha_loss.item(), global_step
+                        )
+                    if args.track:
+                        log_dict = {
+                            "losses/actor_loss": actor_loss.item(),
+                        }
+                        if args.autotune:
+                            log_dict["losses/alpha_loss"] = alpha_loss.item()
+                        wandb.log(log_dict, step=global_step)
             if args.model_type == 'cbpnet':
                 # print("cbpnet: selective initailization")
                 GnT.gen_and_test(actor.model.fc.get_activations())
