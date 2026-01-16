@@ -19,6 +19,10 @@ module load cuda/12.2.0
 module load ffmpeg/4.2.2
 module load mesa/20.2.1
 
+# Use EGL for headless MuJoCo rendering
+export MUJOCO_GL=egl
+export EGL_PLATFORM=surfaceless
+
 # Use scratch for caches/tmp (avoid home quota)
 export XDG_CACHE_HOME=/scratch/yd2247/.cache
 export UV_CACHE_DIR=/scratch/yd2247/.cache/uv
@@ -39,7 +43,17 @@ export PATH="${CONDA_PREFIX}/bin:$PATH"
 
 # Change to experiments directory and run
 cd /scratch/yd2247/cka_rl/experiments/meta-world
-python run_experiments.py \
-    --algorithm cka-rl \
-    --tag main \
-    --seed 42
+python run_experiments_crl.py \
+    --algorithm simple \
+    --tag crl_smoketest \
+    --seed 42 \
+    --task-id 3 \
+    --capture-video \
+    --video-every-n-episodes 50 \
+    --track
+    # --debug true
+
+# python run_experiments.py \
+#     --algorithm cka-rl \
+#     --tag main \
+#     --seed 42 \

@@ -91,6 +91,23 @@ class Args:
     """pool size"""
     encoder_from_base: bool = False
     """load encoder from base_dir"""
+    # The following parameters are for the contrastive loss
+    nce_loss_weight: float = 1.0
+    """weight for the InfoNCE loss"""
+    nce_temperature: float = 0.1
+    """temperature for InfoNCE logits"""
+    nce_proj_dim: int = 128
+    """projection dimension for contrastive features"""
+    nce_hidden_dim: int = 256
+    """hidden dimension for contrastive encoder"""
+    nce_update_freq: int = 1
+    """update contrastive loss every N steps"""
+    nce_start: int = 5_000
+    """global step to start contrastive updates"""
+    nce_aug_std: float = 0.01
+    """stddev for Gaussian noise augmentation"""
+    nce_aug_drop_prob: float = 0.0
+    """feature dropout probability for augmentation"""
 
 def make_env(task_id):
     def thunk():
@@ -99,6 +116,33 @@ def make_env(task_id):
         return env
 
     return thunk
+
+
+def split_obs_and_goal(obs):
+    """Placeholder: extract state and goal from wrapped env outputs.
+
+    If the environment wrapper exposes dict observations, we expect keys like
+    "observation" and "desired_goal"/"goal". Otherwise, treat obs as state-only.
+    """
+    if isinstance(obs, dict):
+        state = obs.get("observation", obs.get("state", None))
+        goal = obs.get("desired_goal", obs.get("goal", None))
+        if state is None:
+            state = obs
+        return state, goal
+    return obs, None
+
+
+def make_contrastive_views(obs):
+    """Placeholder: return two correlated views for InfoNCE.
+
+    For now, return identical views so the code runs without augmentation or a wrapper.
+    Later, replace this with wrapper-based views or real augmentations.
+    """
+    state, goal = split_obs_and_goal(obs)
+    if goal is None:
+        return state, state
+    return state, goal
 
 
 # ALGO LOGIC: initialize agent here:
@@ -165,6 +209,23 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
+
+# contrastive encoder class
+class ContrastiveEncoder(nn.Module):
+    def __init__(self, obs_dim: int, hidden_dim: int, proj_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.proj = nn.Linear(hidden_dim, proj_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        z = self.proj(h)
+        return F.normalize(z, dim=-1)
 
 
 @torch.no_grad()
@@ -246,6 +307,13 @@ if __name__ == "__main__":
     act_dim = np.prod(envs.single_action_space.shape)
     print(obs_dim)
     print(act_dim)
+
+    contrastive_encoder = ContrastiveEncoder(
+        obs_dim=obs_dim,
+        hidden_dim=args.nce_hidden_dim,
+        proj_dim=args.nce_proj_dim,
+    ).to(device)
+
     print(f"*** Loading model `{args.model_type}` ***")
     if args.model_type in ["finetune", "componet"]:
         assert (
@@ -352,6 +420,10 @@ if __name__ == "__main__":
         list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
     )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    # Contrastive learning optimizer
+    contrastive_optimizer = optim.Adam(
+        contrastive_encoder.parameters(), lr=args.q_lr
+    )
     if args.model_type == 'cbpnet':
         actor_optimizer = AdamGnT(actor.parameters(), lr=args.policy_lr, eps=1e-5)
         GnT = GnT(net=actor.model.fc.net, opt=actor_optimizer,replacement_rate=1e-3, decay_rate=0.99, device=device,
@@ -436,6 +508,28 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
+            nce_loss = None
+            if (
+                global_step >= args.nce_start
+                and global_step % args.nce_update_freq == 0
+            ):
+                view1, view2 = make_contrastive_views(data.observations)
+                if isinstance(view1, torch.Tensor):
+                    view1 = view1.to(device)
+                else:
+                    view1 = torch.tensor(view1, device=device, dtype=torch.float32)
+                if isinstance(view2, torch.Tensor):
+                    view2 = view2.to(device)
+                else:
+                    view2 = torch.tensor(view2, device=device, dtype=torch.float32)
+                z1 = contrastive_encoder(view1)
+                z2 = contrastive_encoder(view2)
+                logits = (z1 @ z2.T) / args.nce_temperature
+                labels = torch.arange(logits.shape[0], device=device)
+                nce_loss = 0.5 * (
+                    F.cross_entropy(logits, labels)
+                    + F.cross_entropy(logits.T, labels)
+                )
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(
                     data.next_observations
@@ -455,6 +549,12 @@ if __name__ == "__main__":
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
+
+            # NCE loss
+            if nce_loss is not None:
+                contrastive_optimizer.zero_grad()
+                (args.nce_loss_weight * nce_loss).backward()
+                contrastive_optimizer.step()
 
             # optimize the model
             q_optimizer.zero_grad()
@@ -519,6 +619,10 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+                if nce_loss is not None:
+                    writer.add_scalar(
+                        "losses/nce_loss", nce_loss.item(), global_step
+                    )
                 # print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
@@ -542,6 +646,8 @@ if __name__ == "__main__":
                     }
                     if args.autotune:
                         log_dict["losses/alpha_loss"] = alpha_loss.item()
+                    if nce_loss is not None:
+                        log_dict["losses/nce_loss"] = nce_loss.item()
                     wandb.log(log_dict, step=global_step)
             if args.model_type == 'cbpnet':
                 # print("cbpnet: selective initailization")

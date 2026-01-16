@@ -57,8 +57,8 @@ class Args:
     """Evaluate the agent in determinstic mode every X timesteps"""
     num_evals: int = 10
     """Number of times to evaluate the agent"""
-    total_timesteps: int = int(1e6)
-    """total timesteps of the experiments"""
+    total_timesteps: int = int(1e5)
+    """total timesteps of the experiments (100k for REDQ due to high sample efficiency)"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
@@ -486,10 +486,10 @@ if __name__ == "__main__":
                         args.policy_frequency
                     ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                         pi, log_pi, _ = actor.get_action(data.observations)
-                        # REDQ: Use all Q-networks for actor loss (take minimum)
+                        # REDQ: Use all Q-networks for actor loss (take average, not minimum)
                         q_pi_values = [q_net(data.observations, pi) for q_net in q_nets]
-                        min_qf_pi = torch.min(torch.stack(q_pi_values), dim=0)[0]
-                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                        mean_qf_pi = torch.stack(q_pi_values).mean(dim=0)
+                        actor_loss = ((alpha * log_pi) - mean_qf_pi).mean()
 
                         actor_optimizer.zero_grad()
                         actor_loss.backward()
