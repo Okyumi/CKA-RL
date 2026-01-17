@@ -96,7 +96,7 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
-    debug_print_interval: int = 1
+    debug_print_interval: int = 0
     """print state/action/goal samples every N steps (0 disables)"""
 
 def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir):
@@ -119,24 +119,13 @@ def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir
 
 
 def get_state_goal_dims(obs_space):
-    if isinstance(obs_space, gym.spaces.Dict):
-        state_space = obs_space.get("observation", obs_space.get("state", None))
-        goal_space = obs_space.get("desired_goal", obs_space.get("goal", None))
-        critic_goal_space = obs_space.get("critic_goal", None)
-        if state_space is None:
-            state_dim = int(
-                sum(np.prod(space.shape) for space in obs_space.spaces.values())
-            )
-        else:
-            state_dim = int(np.prod(state_space.shape))
-        goal_dim = int(np.prod(goal_space.shape)) if goal_space is not None else 0
-        critic_goal_dim = (
-            int(np.prod(critic_goal_space.shape)) if critic_goal_space is not None else 0
-        )
-        return state_dim, goal_dim, critic_goal_dim
-    state_dim = int(np.prod(obs_space.shape))
-    # Placeholder: use a dummy goal with same dim as state
-    return state_dim, state_dim, state_dim
+    state_space = obs_space["observation"]
+    goal_space = obs_space["desired_goal"]
+    critic_goal_space = obs_space["critic_goal"]
+    state_dim = int(np.prod(state_space.shape))
+    goal_dim = int(np.prod(goal_space.shape))
+    critic_goal_dim = int(np.prod(critic_goal_space.shape))
+    return state_dim, goal_dim, critic_goal_dim
 
 
 def _concat_last_dim(parts):
@@ -145,48 +134,18 @@ def _concat_last_dim(parts):
     return np.concatenate(parts, axis=-1)
 
 
-def flatten_dict_obs(obs_dict):
-    preferred_keys = [
-        "observation",
-        "state",
-        "achieved_goal",
-        "desired_goal",
-        "goal",
-    ]
-    keys = [key for key in preferred_keys if key in obs_dict]
-    if not keys:
-        keys = sorted(obs_dict.keys())
-    parts = [obs_dict[key] for key in keys]
-    return _concat_last_dim(parts)
-
-
 def split_obs_and_goal(obs):
     """Extract state, actor goal, and critic goal from wrapped env outputs."""
-    if isinstance(obs, dict):
-        state = obs.get("observation", obs.get("state", None))
-        actor_goal = obs.get("desired_goal", obs.get("goal", None))
-        critic_goal = obs.get("critic_goal", None)
-        if state is None:
-            state = flatten_dict_obs(obs)
-        return state, actor_goal, critic_goal
-    return obs, None, None
+    return obs["observation"], obs["desired_goal"], obs["critic_goal"]
 
 
 def build_policy_input(state, actor_goal):
-    if actor_goal is None:
-        if isinstance(state, torch.Tensor):
-            dummy = torch.zeros_like(state)
-        else:
-            dummy = np.zeros_like(state)
-        return _concat_last_dim([state, dummy])
     return _concat_last_dim([state, actor_goal])
 
 
 def sample_goals_from_batch(next_obs):
-    state, _, critic_goal = split_obs_and_goal(next_obs)
-    goals = critic_goal if critic_goal is not None else state
-    if isinstance(goals, dict):
-        goals = flatten_dict_obs(goals)
+    _, _, critic_goal = split_obs_and_goal(next_obs)
+    goals = critic_goal
     if isinstance(goals, torch.Tensor):
         perm = torch.randperm(goals.shape[0], device=goals.device)
         return goals, goals[perm]
@@ -370,17 +329,42 @@ if __name__ == "__main__":
     print(critic_goal_dim)
     print(act_dim)
 
-    phi_encoder = PhiEncoder(
-        state_dim=state_dim,
-        action_dim=act_dim,
-        hidden_dim=args.nce_hidden_dim,
-        proj_dim=args.nce_proj_dim,
-    ).to(device)
-    psi_encoder = PsiEncoder(
-        goal_dim=goal_embed_dim,
-        hidden_dim=args.nce_hidden_dim,
-        proj_dim=args.nce_proj_dim,
-    ).to(device)
+    # Load or create critic encoders
+    phi_encoder = None
+    psi_encoder = None
+    
+    # Try to load encoders from previous task if available
+    if len(args.prev_units) > 0:
+        latest_dir = args.prev_units[-1]
+        phi_path = f"{latest_dir}/phi_encoder.pt"
+        psi_path = f"{latest_dir}/psi_encoder.pt"
+        
+        if os.path.exists(phi_path) and os.path.exists(psi_path):
+            print(f"*** Loading critic encoders from {latest_dir} ***")
+            try:
+                phi_encoder = torch.load(phi_path, map_location=device)
+                psi_encoder = torch.load(psi_path, map_location=device)
+                print("Successfully loaded critic encoders from previous task")
+            except Exception as e:
+                print(f"Warning: Failed to load critic encoders: {e}")
+                print("Initializing new critic encoders")
+                phi_encoder = None
+                psi_encoder = None
+    
+    # Create new encoders if not loaded
+    if phi_encoder is None:
+        print("*** Initializing new critic encoders ***")
+        phi_encoder = PhiEncoder(
+            state_dim=state_dim,
+            action_dim=act_dim,
+            hidden_dim=args.nce_hidden_dim,
+            proj_dim=args.nce_proj_dim,
+        ).to(device)
+        psi_encoder = PsiEncoder(
+            goal_dim=goal_embed_dim,
+            hidden_dim=args.nce_hidden_dim,
+            proj_dim=args.nce_proj_dim,
+        ).to(device)
 
     print(f"*** Loading model `{args.model_type}` ***")
     if args.model_type in ["finetune", "componet"]:
@@ -689,5 +673,10 @@ if __name__ == "__main__":
         wandb.finish()
 
     if args.save_dir is not None:
-        print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
-        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+        save_path = f"{args.save_dir}/{run_name}"
+        print(f"Saving trained agent in `{save_path}`")
+        actor.model.save(dirname=save_path)
+        # Save critic encoders for next task
+        print(f"Saving critic encoders in `{save_path}`")
+        torch.save(phi_encoder, f"{save_path}/phi_encoder.pt")
+        torch.save(psi_encoder, f"{save_path}/psi_encoder.pt")

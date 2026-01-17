@@ -69,7 +69,7 @@ first_idx = modes.index(start_mode)
 for i, task_id in enumerate(modes[first_idx:]):
     params = f"--model-type={args.algorithm} --task-id={task_id} --seed={args.seed} --tag={args.tag}"
     if args.debug:
-        params += " --total-timesteps=10000"
+        params += " --total-timesteps=50"
         params += " --learning_starts=5"
     if args.encoder_from_base:
         params += " --encoder-from-base"

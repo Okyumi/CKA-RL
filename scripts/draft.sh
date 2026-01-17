@@ -43,17 +43,24 @@ export PATH="${CONDA_PREFIX}/bin:$PATH"
 
 # Change to experiments directory and run
 cd /scratch/yd2247/cka_rl/experiments/meta-world
-python run_experiments_crl.py \
-    --algorithm simple \
-    --tag crl_smoketest \
-    --seed 42 \
-    --task-id 3 \
-    --capture-video \
-    --video-every-n-episodes 50 \
-    --track
-    # --debug true
+# python run_experiments_crl.py \
+#     --algorithm cka-rl \
+#     --tag crl_smoketest \
+#     --seed 42 \
+#     --start-mode 0 \
+#     --capture-video \
+#     --video-every-n-episodes 50 \
+#     --track \
+#     --debug True
 
 # python run_experiments.py \
 #     --algorithm cka-rl \
 #     --tag main \
 #     --seed 42 \
+
+python run_experiments_crl.py \
+    --algorithm cka-rl \
+    --tag crl_smoketest \
+    --seed 41 \
+    --track \
+    --debug True
