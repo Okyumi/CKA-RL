@@ -1,5 +1,6 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+# contrastive RL (sigmoid NCE) training script
 import os
+import glob
 import random
 import time
 from dataclasses import dataclass
@@ -11,16 +12,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 import tyro
 import pathlib
 from torch.utils.tensorboard import SummaryWriter
 from typing import Literal, Optional, Tuple
 import wandb
-from models import shared, SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
+from models import SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
 from tasks import get_task
 from utils.AdamGnT import AdamGnT
-from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.buffers import ReplayBuffer, DictReplayBuffer
 from models.cbp_modules import GnT
+from wrapper.goal_wrapper import GoalObsWrapper
 
 
 @dataclass
@@ -49,6 +52,10 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    video_every_n_episodes: int = 50
+    """record one episode every N episodes"""
+    video_dir: str = "videos"
+    """base directory for recorded videos"""
 
     # Algorithm specific arguments
     task_id: int = 0
@@ -61,10 +68,6 @@ class Args:
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
-    gamma: float = 0.99
-    """the discount factor gamma"""
-    tau: float = 0.005
-    """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 128
     """the batch size of sample from the reply memory"""
     learning_starts: int = 5_000
@@ -74,17 +77,7 @@ class Args:
     policy_lr: float = 1e-3
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
-    """the learning rate of the Q network network optimizer"""
-    policy_frequency: int = 2
-    """the frequency of training policy (delayed)"""
-    target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
-    """the frequency of updates for the target nerworks"""
-    noise_clip: float = 0.5
-    """noise clip parameter of the Target Policy Smoothing Regularization"""
-    alpha: float = 0.2
-    """Entropy regularization coefficient."""
-    autotune: bool = True
-    """automatic tuning of the entropy coefficient"""
+    """the learning rate of the contrastive encoders"""
     tag: str = "Debug"
     """experiment tag"""
     pool_size: int = 9
@@ -104,62 +97,61 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
-    nce_aug_std: float = 0.01
-    """stddev for Gaussian noise augmentation"""
-    nce_aug_drop_prob: float = 0.0
-    """feature dropout probability for augmentation"""
+    debug_print_interval: int = 100
+    """print state/action/goal samples every N steps (0 disables)"""
 
-def make_env(task_id):
+def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir):
     def thunk():
         env = get_task(task_id)
+        if capture_video:
+            env.render_mode = "rgb_array"
+        env = GoalObsWrapper(env, goal_dim=3)
+        if capture_video:
+            video_path = os.path.join(video_dir, run_name)
+            env = gym.wrappers.RecordVideo(
+                env,
+                video_path,
+                episode_trigger=lambda ep: ep % video_every_n_episodes == 0,
+            )
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
 
     return thunk
 
 
+def get_state_goal_dims(obs_space):
+    state_space = obs_space["observation"]
+    goal_space = obs_space["desired_goal"]
+    critic_goal_space = obs_space["critic_goal"]
+    state_dim = int(np.prod(state_space.shape))
+    goal_dim = int(np.prod(goal_space.shape))
+    critic_goal_dim = int(np.prod(critic_goal_space.shape))
+    return state_dim, goal_dim, critic_goal_dim
+
+
+def _concat_last_dim(parts):
+    if isinstance(parts[0], torch.Tensor):
+        return torch.cat(parts, dim=-1)
+    return np.concatenate(parts, axis=-1)
+
+
 def split_obs_and_goal(obs):
-    """Placeholder: extract state and goal from wrapped env outputs.
-
-    If the environment wrapper exposes dict observations, we expect keys like
-    "observation" and "desired_goal"/"goal". Otherwise, treat obs as state-only.
-    """
-    if isinstance(obs, dict):
-        state = obs.get("observation", obs.get("state", None))
-        goal = obs.get("desired_goal", obs.get("goal", None))
-        if state is None:
-            state = obs
-        return state, goal
-    return obs, None
+    """Extract state, actor goal, and critic goal from wrapped env outputs."""
+    return obs["observation"], obs["desired_goal"], obs["critic_goal"]
 
 
-def make_contrastive_views(obs):
-    """Placeholder: return two correlated views for InfoNCE.
-
-    For now, return identical views so the code runs without augmentation or a wrapper.
-    Later, replace this with wrapper-based views or real augmentations.
-    """
-    state, goal = split_obs_and_goal(obs)
-    if goal is None:
-        return state, state
-    return state, goal
+def build_policy_input(state, actor_goal):
+    return _concat_last_dim([state, actor_goal])
 
 
-# ALGO LOGIC: initialize agent here:
-class SoftQNetwork(nn.Module):
-    def __init__(self, envs):
-        super().__init__()
-        self.fc = shared(
-            np.array(envs.observation_space.shape).prod()
-            + np.prod(envs.action_space.shape)
-        )
-        self.fc_out = nn.Linear(256, 1)
-
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
-        x = self.fc(x)
-        x = self.fc_out(x)
-        return x
+def sample_goals_from_batch(next_obs):
+    _, _, critic_goal = split_obs_and_goal(next_obs)
+    goals = critic_goal
+    if isinstance(goals, torch.Tensor):
+        perm = torch.randperm(goals.shape[0], device=goals.device)
+        return goals, goals[perm]
+    perm = np.random.permutation(goals.shape[0])
+    return goals, goals[perm]
 
 
 LOG_STD_MAX = 2
@@ -210,22 +202,129 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
 
-# contrastive encoder class
-class ContrastiveEncoder(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, proj_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.proj = nn.Linear(hidden_dim, proj_dim)
 
+def lecun_uniform_init(tensor):
+    """LeCun uniform initialization: variance_scaling(1/3, "fan_in", "uniform")"""
+    fan_in = tensor.size(1)
+    bound = math.sqrt(1.0 / (3.0 * fan_in))
+    with torch.no_grad():
+        tensor.uniform_(-bound, bound)
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with 4 linear layers, following the paper's structure."""
+    def __init__(self, width: int, use_layer_norm: bool = True, use_relu: bool = False):
+        super().__init__()
+        self.width = width
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # 4 linear layers
+        self.layers = nn.ModuleList([
+            nn.Linear(width, width) for _ in range(4)
+        ])
+        
+        # Normalization layers
+        if use_layer_norm:
+            self.norms = nn.ModuleList([
+                nn.LayerNorm(width) for _ in range(4)
+            ])
+        else:
+            self.norms = nn.ModuleList([nn.Identity() for _ in range(4)])
+        
+        # Initialize weights
+        for layer in self.layers:
+            lecun_uniform_init(layer.weight)
+            nn.init.zeros_(layer.bias)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.net(x)
-        z = self.proj(h)
-        return F.normalize(z, dim=-1)
+        identity = x
+        for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
+            x = layer(x)
+            x = norm(x)
+            x = self.activation(x)
+        x = x + identity
+        return x
+
+
+class PhiEncoder(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, proj_dim: int, 
+                 use_layer_norm: bool = True, use_relu: bool = False):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # Initial layer
+        self.initial_layer = nn.Linear(state_dim + action_dim, hidden_dim)
+        if use_layer_norm:
+            self.initial_norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.initial_norm = nn.Identity()
+        
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
+        
+        # Final layer
+        self.final_layer = nn.Linear(hidden_dim, proj_dim)
+        
+        # Initialize weights
+        lecun_uniform_init(self.initial_layer.weight)
+        nn.init.zeros_(self.initial_layer.bias)
+        lecun_uniform_init(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, action], dim=-1)
+        # Initial layer
+        x = self.initial_layer(x)
+        x = self.initial_norm(x)
+        x = self.activation(x)
+        # Residual block
+        x = self.residual_block(x)
+        # Final layer
+        x = self.final_layer(x)
+        return x
+
+
+class PsiEncoder(nn.Module):
+    def __init__(self, goal_dim: int, hidden_dim: int, proj_dim: int,
+                 use_layer_norm: bool = True, use_relu: bool = False):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # Initial layer
+        self.initial_layer = nn.Linear(goal_dim, hidden_dim)
+        if use_layer_norm:
+            self.initial_norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.initial_norm = nn.Identity()
+        
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
+        
+        # Final layer
+        self.final_layer = nn.Linear(hidden_dim, proj_dim)
+        
+        # Initialize weights
+        lecun_uniform_init(self.initial_layer.weight)
+        nn.init.zeros_(self.initial_layer.bias)
+        lecun_uniform_init(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
+
+    def forward(self, goal: torch.Tensor) -> torch.Tensor:
+        x = goal
+        # Initial layer
+        x = self.initial_layer(x)
+        x = self.initial_norm(x)
+        x = self.activation(x)
+        # Residual block
+        x = self.residual_block(x)
+        # Final layer
+        x = self.final_layer(x)
+        return x
 
 
 @torch.no_grad()
@@ -236,8 +335,10 @@ def eval_agent(agent, test_env, num_evals, global_step, writer, device):
     ep_ret = 0
     for _ in range(num_evals):
         while True:
-            obs = torch.Tensor(obs).to(device).unsqueeze(0)
-            action, _ = agent(obs)
+            state, actor_goal, _ = split_obs_and_goal(obs)
+            policy_input = build_policy_input(state, actor_goal)
+            policy_input = torch.Tensor(policy_input).to(device).unsqueeze(0)
+            action, _, _ = agent.get_action(policy_input)
             obs, reward, termination, truncation, info = test_env.step(
                 action[0].cpu().numpy()
             )
@@ -295,24 +396,66 @@ if __name__ == "__main__":
     print(f"*** Device: {device}")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.task_id)])
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
-
-    max_action = float(envs.single_action_space.high[0])
+    envs = gym.vector.SyncVectorEnv(
+        [
+            make_env(
+                args.task_id,
+                args.capture_video,
+                f"{args.tag}/{run_name}",
+                args.video_every_n_episodes,
+                args.video_dir,
+            )
+        ]
+    )
 
     # select the model to use as the agent
-    obs_dim = np.array(envs.single_observation_space.shape).prod()
+    state_dim, goal_dim, critic_goal_dim = get_state_goal_dims(
+        envs.single_observation_space
+    )
+    obs_dim = state_dim + goal_dim
+    goal_embed_dim = critic_goal_dim if critic_goal_dim > 0 else state_dim
     act_dim = np.prod(envs.single_action_space.shape)
-    print(obs_dim)
+    print(state_dim)
+    print(goal_dim)
+    print(critic_goal_dim)
     print(act_dim)
 
-    contrastive_encoder = ContrastiveEncoder(
-        obs_dim=obs_dim,
-        hidden_dim=args.nce_hidden_dim,
-        proj_dim=args.nce_proj_dim,
-    ).to(device)
+    # Load or create critic encoders
+    phi_encoder = None
+    psi_encoder = None
+    
+    # Try to load encoders from previous task if available
+    if len(args.prev_units) > 0:
+        latest_dir = args.prev_units[-1]
+        phi_path = f"{latest_dir}/phi_encoder.pt"
+        psi_path = f"{latest_dir}/psi_encoder.pt"
+        
+        if os.path.exists(phi_path) and os.path.exists(psi_path):
+            print(f"*** Loading critic encoders from {latest_dir} ***")
+            try:
+                phi_encoder = torch.load(phi_path, map_location=device)
+                psi_encoder = torch.load(psi_path, map_location=device)
+                print("Successfully loaded critic encoders from previous task")
+            except Exception as e:
+                print(f"Warning: Failed to load critic encoders: {e}")
+                print("Initializing new critic encoders")
+                phi_encoder = None
+                psi_encoder = None
+    
+    # Create new encoders if not loaded
+    if phi_encoder is None:
+        print("*** Initializing new critic encoders ***")
+        phi_encoder = PhiEncoder(
+            state_dim=state_dim,
+            action_dim=act_dim,
+            hidden_dim=args.nce_hidden_dim,
+            proj_dim=args.nce_proj_dim,
+        ).to(device)
+        psi_encoder = PsiEncoder(
+            goal_dim=goal_embed_dim,
+            hidden_dim=args.nce_hidden_dim,
+            proj_dim=args.nce_proj_dim,
+        ).to(device)
 
     print(f"*** Loading model `{args.model_type}` ***")
     if args.model_type in ["finetune", "componet"]:
@@ -410,44 +553,33 @@ if __name__ == "__main__":
             ).to(device)
         
     actor = Actor(envs, model).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
-    )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
-    # Contrastive learning optimizer
-    contrastive_optimizer = optim.Adam(
-        contrastive_encoder.parameters(), lr=args.q_lr
+    critic_optimizer = optim.Adam(
+        list(phi_encoder.parameters()) + list(psi_encoder.parameters()),
+        lr=args.q_lr,
     )
     if args.model_type == 'cbpnet':
         actor_optimizer = AdamGnT(actor.parameters(), lr=args.policy_lr, eps=1e-5)
         GnT = GnT(net=actor.model.fc.net, opt=actor_optimizer,replacement_rate=1e-3, decay_rate=0.99, device=device,
                     maturity_threshold=1000, util_type="contribution")
-        
-    # Automatic entropy tuning
-    if args.autotune:
-        target_entropy = -torch.prod(
-            torch.Tensor(envs.action_space.shape).to(device)
-        ).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
-    else:
-        alpha = args.alpha
 
-    envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        handle_timeout_termination=False,
-    )
+    if isinstance(envs.single_observation_space, gym.spaces.Box):
+        envs.single_observation_space.dtype = np.float32
+        rb = ReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            handle_timeout_termination=False,
+        )
+    else:
+        rb = DictReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            handle_timeout_termination=False,
+        )
 
     start_time = time.time()
 
@@ -460,15 +592,26 @@ if __name__ == "__main__":
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
         else:
+            state, actor_goal, _ = split_obs_and_goal(obs)
+            policy_input = build_policy_input(state, actor_goal)
+            policy_input = torch.Tensor(policy_input).to(device)
             if args.model_type == "componet" and global_step % 1000 == 0:
                 actions, _, _ = actor.get_action(
-                    torch.Tensor(obs).to(device),
+                    policy_input,
                     writer=writer,
                     global_step=global_step,
                 )
             else:
-                actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+                actions, _, _ = actor.get_action(policy_input)
             actions = actions.detach().cpu().numpy()
+            if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
+                print("=== Actor input (step) ===")
+                print("state[0]:", np.asarray(state)[0] if np.asarray(state).ndim > 1 else np.asarray(state))
+                if actor_goal is None:
+                    print("goal: None (dummy used for policy input)")
+                else:
+                    print("goal[0]:", np.asarray(actor_goal)[0] if np.asarray(actor_goal).ndim > 1 else np.asarray(actor_goal))
+                print("action[0]:", actions[0] if actions.ndim > 1 else actions)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -507,147 +650,99 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            nce_loss = None
-            if (
+            update_step = (
                 global_step >= args.nce_start
                 and global_step % args.nce_update_freq == 0
-            ):
-                view1, view2 = make_contrastive_views(data.observations)
-                if isinstance(view1, torch.Tensor):
-                    view1 = view1.to(device)
-                else:
-                    view1 = torch.tensor(view1, device=device, dtype=torch.float32)
-                if isinstance(view2, torch.Tensor):
-                    view2 = view2.to(device)
-                else:
-                    view2 = torch.tensor(view2, device=device, dtype=torch.float32)
-                z1 = contrastive_encoder(view1)
-                z2 = contrastive_encoder(view2)
-                logits = (z1 @ z2.T) / args.nce_temperature
-                labels = torch.arange(logits.shape[0], device=device)
-                nce_loss = 0.5 * (
-                    F.cross_entropy(logits, labels)
-                    + F.cross_entropy(logits.T, labels)
-                )
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
-                )
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_state_log_pi
-                )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
+            )
+            data = rb.sample(args.batch_size)
+            nce_loss = None
+            actor_loss = None
+            pos_score = None
+            neg_score = None
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+            if update_step:
+                state, _, _ = split_obs_and_goal(data.observations)
+                state = state.to(device) if isinstance(state, torch.Tensor) else torch.tensor(
+                    state, device=device, dtype=torch.float32
+                )
+                state = state.float()
+                goals_pos, _ = sample_goals_from_batch(data.next_observations)
+                goals_pos = goals_pos.to(device) if isinstance(goals_pos, torch.Tensor) else torch.tensor(
+                    goals_pos, device=device, dtype=torch.float32
+                )
+                goals_pos = goals_pos.float()
+                actions = data.actions.float()
 
-            # NCE loss
-            if nce_loss is not None:
-                contrastive_optimizer.zero_grad()
+                phi = phi_encoder(state, actions)
+                psi_pos = psi_encoder(goals_pos)
+                logits = (phi @ psi_pos.T) / args.nce_temperature
+                labels = torch.arange(logits.shape[0], device=logits.device)
+                nce_loss = F.cross_entropy(logits, labels)
+                pos_logits = logits.diag()
+                pos_score = pos_logits.mean().item()
+                if logits.shape[0] > 1:
+                    neg_mask = ~torch.eye(
+                        logits.shape[0], dtype=torch.bool, device=logits.device
+                    )
+                    neg_score = logits[neg_mask].mean().item()
+
+                critic_optimizer.zero_grad()
                 (args.nce_loss_weight * nce_loss).backward()
-                contrastive_optimizer.step()
+                critic_optimizer.step()
 
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
+                policy_input = build_policy_input(state, goals_pos)
+                pi, _, _ = actor.get_action(policy_input)
+                phi_pi = phi_encoder(state, pi)
+                psi_goal = psi_encoder(goals_pos).detach()
+                actor_loss = -(phi_pi * psi_goal).sum(dim=-1).mean()
 
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
-
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    if args.model_type == "packnet":
-                        if global_step >= packnet_retrain_start:
-                            # can be called multiple times, only the first counts
-                            actor.model.start_retraining()
-                        actor.model.before_update()
-                    actor_optimizer.step()
-
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (
-                            -log_alpha.exp() * (log_pi + target_entropy)
-                        ).mean()
-
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
-
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                if args.model_type == "packnet":
+                    if global_step >= packnet_retrain_start:
+                        # can be called multiple times, only the first counts
+                        actor.model.start_retraining()
+                    actor.model.before_update()
+                actor_optimizer.step()
+                if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
+                    print("=== Encoder batch (update) ===")
+                    print("state[0]:", state[0].detach().cpu().numpy())
+                    print("action[0]:", actions[0].detach().cpu().numpy())
+                    print("goal_pos[0]:", goals_pos[0].detach().cpu().numpy())
+                    row0 = logits[0].detach().cpu().numpy()
+                    print("=== InfoNCE logits (row 0) ===")
+                    print("pos_logit:", row0[0])
+                    print("neg_logits:", row0[1: min(6, len(row0))])
+                    print("nce_loss:", nce_loss.item())
 
             if global_step % 100 == 0:
-                writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
-                )
-                writer.add_scalar(
-                    "losses/qf2_values", qf2_a_values.mean().item(), global_step
-                )
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
                 if nce_loss is not None:
+                    writer.add_scalar("losses/nce_loss", nce_loss.item(), global_step)
+                if actor_loss is not None:
                     writer.add_scalar(
-                        "losses/nce_loss", nce_loss.item(), global_step
+                        "losses/actor_loss", actor_loss.item(), global_step
                     )
-                # print("SPS:", int(global_step / (time.time() - start_time)))
+                if pos_score is not None:
+                    writer.add_scalar("metrics/pos_score", pos_score, global_step)
+                if neg_score is not None:
+                    writer.add_scalar("metrics/neg_score", neg_score, global_step)
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
                     global_step,
                 )
-                if args.autotune:
-                    writer.add_scalar(
-                        "losses/alpha_loss", alpha_loss.item(), global_step
-                    )
                 if args.track:
                     log_dict = {
-                        "losses/qf1_values": qf1_a_values.mean().item(),
-                        "losses/qf2_values": qf2_a_values.mean().item(),
-                        "losses/qf1_loss": qf1_loss.item(),
-                        "losses/qf2_loss": qf2_loss.item(),
-                        "losses/qf_loss": qf_loss.item() / 2.0,
-                        "losses/actor_loss": actor_loss.item(),
-                        "losses/alpha": alpha,
                         "charts/SPS": int(global_step / (time.time() - start_time)),
                     }
-                    if args.autotune:
-                        log_dict["losses/alpha_loss"] = alpha_loss.item()
                     if nce_loss is not None:
                         log_dict["losses/nce_loss"] = nce_loss.item()
+                    if actor_loss is not None:
+                        log_dict["losses/actor_loss"] = actor_loss.item()
+                    if pos_score is not None:
+                        log_dict["metrics/pos_score"] = pos_score
+                    if neg_score is not None:
+                        log_dict["metrics/neg_score"] = neg_score
                     wandb.log(log_dict, step=global_step)
             if args.model_type == 'cbpnet':
                 # print("cbpnet: selective initailization")
@@ -659,9 +754,20 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+    if args.track and args.capture_video:
+        video_path = os.path.join(args.video_dir, args.tag, run_name)
+        video_files = sorted(glob.glob(os.path.join(video_path, "*.mp4")))
+        if video_files:
+            for video_file in video_files[:3]:
+                wandb.log({"videos": wandb.Video(video_file)}, step=global_step)
     if args.track:
         wandb.finish()
 
     if args.save_dir is not None:
-        print(f"Saving trained agent in `{args.save_dir}` with name `{run_name}`")
-        actor.model.save(dirname=f"{args.save_dir}/{run_name}")
+        save_path = f"{args.save_dir}/{run_name}"
+        print(f"Saving trained agent in `{save_path}`")
+        actor.model.save(dirname=save_path)
+        # Save critic encoders for next task
+        print(f"Saving critic encoders in `{save_path}`")
+        torch.save(phi_encoder, f"{save_path}/phi_encoder.pt")
+        torch.save(psi_encoder, f"{save_path}/psi_encoder.pt")

@@ -39,19 +39,31 @@ This document provides a detailed analysis of MetaWorld goal-observable environm
 
 ### Observation Structure
 
-The observation is a **flat numpy array of 39 dimensions**, NOT a dictionary. The structure appears to be:
+The observation is a **flat numpy array of 39 dimensions**, NOT a dictionary. According to MetaWorld documentation, the standardized structure is:
 
 ```
 observation = [
-    state_dimensions (first 36 dims),  # Robot state, object positions, etc.
-    goal_dimensions (last 3 dims)       # [x, y, z] goal position
+    0:2    End-effector XYZ position (3 dims)
+    3      Gripper open/close scalar (1 dim)
+    4:6    Object 1 XYZ position (3 dims)
+    7:10   Object 1 quaternion orientation (4 dims)
+    11:13  Object 2 XYZ position (3 dims, if present; else zero)
+    14:17  Object 2 quaternion orientation (4 dims)
+    ...    Additional state variables (velocities, previous observations, etc.)
+    36:38  Goal position XYZ (3 dims) - target position for the manipulated object
 ]
 ```
 
+**For Task 3 (PushBackV2GoalObservable) specifically:**
+- **Object's current position**: Indices **4, 5, 6** (Object 1 XYZ)
+- **Object's target position**: Indices **36, 37, 38** (Goal XYZ)
+- Success is determined by checking if the distance between `obs[4:7]` and `obs[36:39]` is within `TARGET_RADIUS` (0.05)
+
 **Evidence from inspection:**
 - Last 10 values: `[0.24, 0.64, 0.11, 1., 0., 0., 0., 0.24, 0.74, 0.11]`
-- The last 3 values `[0.24, 0.74, 0.11]` match the goal space bounds `[0.2399-0.2401, 0.7399-0.7401, 0.109-0.111]`
+- The last 3 values `[0.24, 0.74, 0.11]` (indices 36-38) match the goal space bounds `[0.2399-0.2401, 0.7399-0.7401, 0.109-0.111]`
 - The environment's `goal` attribute is `[0., 0.5, 0.]` (normalized/scaled differently)
+- For Task 3, observation last 3 values `[0.06039558, 0.61790289, 0.01993605]` match goal `[0., 0.6, 0.02]` within goal space bounds
 
 ### Observation Values (Example)
 

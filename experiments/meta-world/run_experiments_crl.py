@@ -49,8 +49,8 @@ def parse_args():
 args = parse_args()
 
 # modes = list(range(20)) if args.algorithm != "simple" else list(range(10))
-# modes = [args.task_id]
-modes = list(range(10)) 
+modes = [args.task_id]
+# modes = list(range(10)) 
 # args.start_mode = 3
 if args.algorithm not in ["simple", "packnet", "prognet", "cka-rl", "masknet", "cbpnet", "crelus"] and args.start_mode == 0:
     start_mode = 1
@@ -69,7 +69,7 @@ first_idx = modes.index(start_mode)
 for i, task_id in enumerate(modes[first_idx:]):
     params = f"--model-type={args.algorithm} --task-id={task_id} --seed={args.seed} --tag={args.tag}"
     if args.debug:
-        params += " --total-timesteps=50"
+        params += " --total-timesteps=10000"
         params += " --learning_starts=5"
     if args.encoder_from_base:
         params += " --encoder-from-base"

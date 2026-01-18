@@ -58,9 +58,18 @@ cd /scratch/yd2247/cka_rl/experiments/meta-world
 #     --tag main \
 #     --seed 42 \
 
+# python run_experiments_crl.py \
+#     --algorithm cka-rl \
+#     --tag crl_smoketest \
+#     --seed 39 \
+#     --capture-video \
+#     --video-every-n-episodes 50 \
+#     --track \
+#     --task-id 3
+
 python run_experiments_crl.py \
     --algorithm cka-rl \
     --tag crl_smoketest \
-    --seed 41 \
+    --seed 40 \
     --track \
     --debug True

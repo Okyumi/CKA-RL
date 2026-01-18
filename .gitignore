@@ -14,3 +14,6 @@ experiments/meta-world/runs/
 experiments/meta-world/agents/
 experiments/meta-world/models/__pycache__/
 experiments/meta-world/wandb/
+*.mp4
+experiments/meta-world/videos/
+Trash/

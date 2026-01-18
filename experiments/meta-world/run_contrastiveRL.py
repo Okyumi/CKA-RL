@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 import tyro
 import pathlib
 from torch.utils.tensorboard import SummaryWriter
@@ -20,9 +21,9 @@ import wandb
 from models import SimpleAgent, CompoNetAgent, PackNetAgent, ProgressiveNetAgent, CkaRlAgent, MaskNetAgent, CbpAgent, CReLUsAgent
 from tasks import get_task
 from utils.AdamGnT import AdamGnT
-from stable_baselines3.common.buffers import ReplayBuffer, DictReplayBuffer
 from models.cbp_modules import GnT
 from wrapper.goal_wrapper import GoalObsWrapper
+from buffer import TrajectoryBuffer
 
 
 @dataclass
@@ -96,7 +97,7 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
-    debug_print_interval: int = 0
+    debug_print_interval: int = 100
     """print state/action/goal samples every N steps (0 disables)"""
 
 def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir):
@@ -143,14 +144,6 @@ def build_policy_input(state, actor_goal):
     return _concat_last_dim([state, actor_goal])
 
 
-def sample_goals_from_batch(next_obs):
-    _, _, critic_goal = split_obs_and_goal(next_obs)
-    goals = critic_goal
-    if isinstance(goals, torch.Tensor):
-        perm = torch.randperm(goals.shape[0], device=goals.device)
-        return goals, goals[perm]
-    perm = np.random.permutation(goals.shape[0])
-    return goals, goals[perm]
 
 
 LOG_STD_MAX = 2
@@ -202,35 +195,128 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
-class PhiEncoder(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, proj_dim: int):
+def lecun_uniform_init(tensor):
+    """LeCun uniform initialization: variance_scaling(1/3, "fan_in", "uniform")"""
+    fan_in = tensor.size(1)
+    bound = math.sqrt(1.0 / (3.0 * fan_in))
+    with torch.no_grad():
+        tensor.uniform_(-bound, bound)
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with 4 linear layers, following the paper's structure."""
+    def __init__(self, width: int, use_layer_norm: bool = True, use_relu: bool = False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
+        self.width = width
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # 4 linear layers
+        self.layers = nn.ModuleList([
+            nn.Linear(width, width) for _ in range(4)
+        ])
+        
+        # Normalization layers
+        if use_layer_norm:
+            self.norms = nn.ModuleList([
+                nn.LayerNorm(width) for _ in range(4)
+            ])
+        else:
+            self.norms = nn.ModuleList([nn.Identity() for _ in range(4)])
+        
+        # Initialize weights
+        for layer in self.layers:
+            lecun_uniform_init(layer.weight)
+            nn.init.zeros_(layer.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
+            x = layer(x)
+            x = norm(x)
+            x = self.activation(x)
+        x = x + identity
+        return x
+
+
+class PhiEncoder(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, proj_dim: int, 
+                 use_layer_norm: bool = True, use_relu: bool = False):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # Initial layer
+        self.initial_layer = nn.Linear(state_dim + action_dim, hidden_dim)
+        if use_layer_norm:
+            self.initial_norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.initial_norm = nn.Identity()
+        
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
+        
+        # Final layer
+        self.final_layer = nn.Linear(hidden_dim, proj_dim)
+        
+        # Initialize weights
+        lecun_uniform_init(self.initial_layer.weight)
+        nn.init.zeros_(self.initial_layer.bias)
+        lecun_uniform_init(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         x = torch.cat([state, action], dim=-1)
-        return self.net(x)
+        # Initial layer
+        x = self.initial_layer(x)
+        x = self.initial_norm(x)
+        x = self.activation(x)
+        # Residual block
+        x = self.residual_block(x)
+        # Final layer
+        x = self.final_layer(x)
+        return x
 
 
 class PsiEncoder(nn.Module):
-    def __init__(self, goal_dim: int, hidden_dim: int, proj_dim: int):
+    def __init__(self, goal_dim: int, hidden_dim: int, proj_dim: int,
+                 use_layer_norm: bool = True, use_relu: bool = False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(goal_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
+        self.hidden_dim = hidden_dim
+        self.use_layer_norm = use_layer_norm
+        self.activation = nn.ReLU() if use_relu else nn.SiLU()
+        
+        # Initial layer
+        self.initial_layer = nn.Linear(goal_dim, hidden_dim)
+        if use_layer_norm:
+            self.initial_norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.initial_norm = nn.Identity()
+        
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
+        
+        # Final layer
+        self.final_layer = nn.Linear(hidden_dim, proj_dim)
+        
+        # Initialize weights
+        lecun_uniform_init(self.initial_layer.weight)
+        nn.init.zeros_(self.initial_layer.bias)
+        lecun_uniform_init(self.final_layer.weight)
+        nn.init.zeros_(self.final_layer.bias)
 
     def forward(self, goal: torch.Tensor) -> torch.Tensor:
-        return self.net(goal)
+        x = goal
+        # Initial layer
+        x = self.initial_layer(x)
+        x = self.initial_norm(x)
+        x = self.activation(x)
+        # Residual block
+        x = self.residual_block(x)
+        # Final layer
+        x = self.final_layer(x)
+        return x
 
 
 @torch.no_grad()
@@ -313,9 +399,6 @@ if __name__ == "__main__":
             )
         ]
     )
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
 
     # select the model to use as the agent
     state_dim, goal_dim, critic_goal_dim = get_state_goal_dims(
@@ -472,23 +555,18 @@ if __name__ == "__main__":
         GnT = GnT(net=actor.model.fc.net, opt=actor_optimizer,replacement_rate=1e-3, decay_rate=0.99, device=device,
                     maturity_threshold=1000, util_type="contribution")
 
-    if isinstance(envs.single_observation_space, gym.spaces.Box):
-        envs.single_observation_space.dtype = np.float32
-        rb = ReplayBuffer(
-            args.buffer_size,
-            envs.single_observation_space,
-            envs.single_action_space,
-            device,
-            handle_timeout_termination=False,
-        )
-    else:
-        rb = DictReplayBuffer(
-            args.buffer_size,
-            envs.single_observation_space,
-            envs.single_action_space,
-            device,
-            handle_timeout_termination=False,
-        )
+    # Initialize trajectory-aware replay buffer for contrastive RL
+    # This buffer automatically samples future goals from the same trajectory
+    rb = TrajectoryBuffer(
+        buffer_size=args.buffer_size,
+        observation_space=envs.single_observation_space,
+        action_space=envs.single_action_space,
+        device=device,
+        episode_length=500,  # Typical MetaWorld episode length
+        gamma=0.99,  # Discount factor for geometric distribution
+        goal_start_idx=4,  # Goal indices [4, 5, 6] for MetaWorld
+        goal_end_idx=7,
+    )
 
     start_time = time.time()
 
@@ -552,7 +630,7 @@ if __name__ == "__main__":
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, real_next_obs, actions, rewards, terminations, infos, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -570,17 +648,11 @@ if __name__ == "__main__":
             neg_score = None
 
             if update_step:
-                state, _, _ = split_obs_and_goal(data.observations)
-                state = state.to(device) if isinstance(state, torch.Tensor) else torch.tensor(
-                    state, device=device, dtype=torch.float32
-                )
-                state = state.float()
-                goals_pos, _ = sample_goals_from_batch(data.next_observations)
-                goals_pos = goals_pos.to(device) if isinstance(goals_pos, torch.Tensor) else torch.tensor(
-                    goals_pos, device=device, dtype=torch.float32
-                )
-                goals_pos = goals_pos.float()
-                actions = data.actions.float()
+                # Extract state and goals from buffer
+                # TrajectoryBuffer already samples future goals from same trajectory
+                state = data.observations.observation.to(device).float()
+                goals_pos = data.observations.critic_goal.to(device).float()
+                actions = data.actions.to(device).float()
 
                 phi = phi_encoder(state, actions)
                 psi_pos = psi_encoder(goals_pos)
