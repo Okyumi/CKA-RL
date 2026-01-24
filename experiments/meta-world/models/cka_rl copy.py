@@ -23,9 +23,7 @@ class CkaRlAgent(nn.Module):
                  encoder_from_base = False,
                  use_alpha_scale = True,
                  fuse_shared = False, 
-                 fuse_heads = True,
-                 network_width: int = 1024,
-                 network_depth: int = 4,):
+                 fuse_heads = True,):
         super().__init__()
         self.delta_theta_mode = delta_theta_mode
         self.global_alpha = global_alpha
@@ -54,24 +52,18 @@ class CkaRlAgent(nn.Module):
             self.fc = torch.load(f"{latest_dir}/fc.pt")
         else:
             logger.info("Train shared from scratch")
-            self.fc = shared(
-                input_dim=obs_dim,
-                network_width=network_width,
-                network_depth=network_depth,
-            )
-
-        self.fc_output_dim = getattr(self.fc, "output_dim", 256)
+            self.fc = shared(input_dim=obs_dim)
             
         self.setup_heads()
 
     def setup_heads(self):
         if self.fuse_heads:
             logger.debug("CKA-RL fuse heads")
-            self.fc_mean = FuseLinear(self.fc_output_dim, 
+            self.fc_mean = FuseLinear(256, 
                                     self.act_dim, alpha=self.alpha, 
                                     alpha_scale=self.alpha_scale, 
                                     num_weights=self.num_vectors)
-            self.fc_logstd = FuseLinear(self.fc_output_dim, 
+            self.fc_logstd = FuseLinear(256, 
                                         self.act_dim, alpha=self.alpha, 
                                         alpha_scale=self.alpha_scale, 
                                         num_weights=self.num_vectors)
@@ -81,8 +73,8 @@ class CkaRlAgent(nn.Module):
                 self.fc_mean.set_base_and_vectors(self.fc_mean_base, self.fc_mean_vectors)
                 self.fc_logstd.set_base_and_vectors(self.fc_logstd_base, self.fc_logstd_vectors)
         else:
-            self.fc_mean = nn.Linear(self.fc_output_dim, self.act_dim)
-            self.fc_logstd = nn.Linear(self.fc_output_dim, self.act_dim)
+            self.fc_mean = nn.Linear(256, self.act_dim)
+            self.fc_logstd = nn.Linear(256, self.act_dim)
         
 
     def load_base_and_vectors(self, base_dir, vector_dirs, module_name):

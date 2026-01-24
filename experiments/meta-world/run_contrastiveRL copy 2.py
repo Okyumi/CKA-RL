@@ -78,10 +78,6 @@ class Args:
     """the learning rate of the policy network optimizer"""
     q_lr: float = 1e-3
     """the learning rate of the contrastive encoders"""
-    alpha: float = 0.2
-    """entropy regularization coefficient"""
-    autotune: bool = True
-    """automatic tuning of the entropy coefficient"""
     tag: str = "Debug"
     """experiment tag"""
     pool_size: int = 9
@@ -95,37 +91,21 @@ class Args:
     """temperature for InfoNCE logits"""
     nce_proj_dim: int = 128
     """projection dimension for contrastive features"""
-    nce_hidden_dim: int = 1024
+    nce_hidden_dim: int = 256
     """hidden dimension for contrastive encoder"""
-    critic_network_depth: int = 16
-    """depth (multiple of 4) for critic encoders"""
-    nce_update_freq: int = 40
+    nce_update_freq: int = 1
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
-    logsumexp_penalty_coeff: float = 1e-3
-    """logsumexp regularization coefficient for critic loss"""
-    actor_network_width: int = 1024
-    """hidden width for actor shared trunk"""
-    actor_network_depth: int = 16
-    """depth (multiple of 4) for actor shared trunk"""
-    num_envs: int = 16
-    """number of parallel environments"""
-    num_episodes_per_env: int = 1
-    """number of trajectory batches sampled per training step"""
-    num_sgd_batches_per_training_step: int = 1
-    """number of SGD batches per training step when subsampling"""
-    use_all_batches: int = 1
-    """if 0, subsample SGD batches per training step"""
     debug_print_interval: int = 100
     """print state/action/goal samples every N steps (0 disables)"""
 
-def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir, augment_goal=True):
+def make_env(task_id, capture_video, run_name, video_every_n_episodes, video_dir):
     def thunk():
         env = get_task(task_id)
         if capture_video:
             env.render_mode = "rgb_array"
-        env = GoalObsWrapper(env, goal_dim=3, augment_goal=augment_goal)
+        env = GoalObsWrapper(env, goal_dim=3)
         if capture_video:
             video_path = os.path.join(video_dir, run_name)
             env = gym.wrappers.RecordVideo(
@@ -260,16 +240,8 @@ class ResidualBlock(nn.Module):
 
 
 class PhiEncoder(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dim: int,
-        proj_dim: int,
-        depth: int = 4,
-        use_layer_norm: bool = True,
-        use_relu: bool = False,
-    ):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, proj_dim: int, 
+                 use_layer_norm: bool = True, use_relu: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_layer_norm = use_layer_norm
@@ -282,11 +254,8 @@ class PhiEncoder(nn.Module):
         else:
             self.initial_norm = nn.Identity()
         
-        # Residual blocks (4 layers each)
-        num_blocks = max(1, depth // 4)
-        self.residual_blocks = nn.ModuleList(
-            [ResidualBlock(hidden_dim, use_layer_norm, use_relu) for _ in range(num_blocks)]
-        )
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
         
         # Final layer
         self.final_layer = nn.Linear(hidden_dim, proj_dim)
@@ -303,24 +272,16 @@ class PhiEncoder(nn.Module):
         x = self.initial_layer(x)
         x = self.initial_norm(x)
         x = self.activation(x)
-        # Residual blocks
-        for block in self.residual_blocks:
-            x = block(x)
+        # Residual block
+        x = self.residual_block(x)
         # Final layer
         x = self.final_layer(x)
         return x
 
 
 class PsiEncoder(nn.Module):
-    def __init__(
-        self,
-        goal_dim: int,
-        hidden_dim: int,
-        proj_dim: int,
-        depth: int = 4,
-        use_layer_norm: bool = True,
-        use_relu: bool = False,
-    ):
+    def __init__(self, goal_dim: int, hidden_dim: int, proj_dim: int,
+                 use_layer_norm: bool = True, use_relu: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.use_layer_norm = use_layer_norm
@@ -333,11 +294,8 @@ class PsiEncoder(nn.Module):
         else:
             self.initial_norm = nn.Identity()
         
-        # Residual blocks (4 layers each)
-        num_blocks = max(1, depth // 4)
-        self.residual_blocks = nn.ModuleList(
-            [ResidualBlock(hidden_dim, use_layer_norm, use_relu) for _ in range(num_blocks)]
-        )
+        # Residual block (keeping same depth, replacing middle layer)
+        self.residual_block = ResidualBlock(hidden_dim, use_layer_norm, use_relu)
         
         # Final layer
         self.final_layer = nn.Linear(hidden_dim, proj_dim)
@@ -354,9 +312,8 @@ class PsiEncoder(nn.Module):
         x = self.initial_layer(x)
         x = self.initial_norm(x)
         x = self.activation(x)
-        # Residual blocks
-        for block in self.residual_blocks:
-            x = block(x)
+        # Residual block
+        x = self.residual_block(x)
         # Final layer
         x = self.final_layer(x)
         return x
@@ -439,9 +396,7 @@ if __name__ == "__main__":
                 f"{args.tag}/{run_name}",
                 args.video_every_n_episodes,
                 args.video_dir,
-                augment_goal=True,
             )
-            for _ in range(args.num_envs)
         ]
     )
 
@@ -487,13 +442,11 @@ if __name__ == "__main__":
             action_dim=act_dim,
             hidden_dim=args.nce_hidden_dim,
             proj_dim=args.nce_proj_dim,
-            depth=args.critic_network_depth,
         ).to(device)
         psi_encoder = PsiEncoder(
             goal_dim=goal_embed_dim,
             hidden_dim=args.nce_hidden_dim,
             proj_dim=args.nce_proj_dim,
-            depth=args.critic_network_depth,
         ).to(device)
 
     print(f"*** Loading model `{args.model_type}` ***")
@@ -503,12 +456,7 @@ if __name__ == "__main__":
         ), f"Model type {args.model_type} requires at least one previous unit"
 
     if args.model_type == "simple":
-        model = SimpleAgent(
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-            network_width=args.actor_network_width,
-            network_depth=args.actor_network_depth,
-        ).to(device)
+        model = SimpleAgent(obs_dim=obs_dim, act_dim=act_dim).to(device)
 
     elif args.model_type == "finetune":
         model = SimpleAgent.load(
@@ -559,8 +507,6 @@ if __name__ == "__main__":
             fuse_heads=True,
             pool_size=args.pool_size,
             encoder_from_base=args.encoder_from_base,
-            network_width=args.actor_network_width,
-            network_depth=args.actor_network_depth,
         )
     elif args.model_type == 'masknet':
         if len(args.prev_units) == 0:
@@ -568,8 +514,6 @@ if __name__ == "__main__":
                 obs_dim=obs_dim,
                 act_dim=act_dim,
                 num_tasks=20,
-                network_width=args.actor_network_width,
-                network_depth=args.actor_network_depth,
             ).to(device)
         else:
             model = MaskNetAgent.load(
@@ -611,18 +555,6 @@ if __name__ == "__main__":
         GnT = GnT(net=actor.model.fc.net, opt=actor_optimizer,replacement_rate=1e-3, decay_rate=0.99, device=device,
                     maturity_threshold=1000, util_type="contribution")
 
-    # Automatic entropy tuning
-    if args.autotune:
-        target_entropy = -torch.prod(
-            torch.Tensor(envs.single_action_space.shape).to(device)
-        ).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
-    else:
-        alpha = args.alpha
-    alpha_state = {"value": alpha}
-
     # Initialize trajectory-aware replay buffer for contrastive RL
     # This buffer automatically samples future goals from the same trajectory
     rb = TrajectoryBuffer(
@@ -630,7 +562,6 @@ if __name__ == "__main__":
         observation_space=envs.single_observation_space,
         action_space=envs.single_action_space,
         device=device,
-        num_envs=envs.num_envs,
         episode_length=500,  # Typical MetaWorld episode length
         gamma=0.99,  # Discount factor for geometric distribution
         goal_start_idx=4,  # Goal indices [4, 5, 6] for MetaWorld
@@ -638,97 +569,6 @@ if __name__ == "__main__":
     )
 
     start_time = time.time()
-
-    def update_actor(state, goals_pos, global_step):
-        def actor_loss(policy_input):
-            pi, log_pi, _ = actor.get_action(policy_input)
-            phi_pi = phi_encoder(state, pi)
-            psi_goal = psi_encoder(goals_pos).detach()
-            qf_pi = -torch.sqrt(torch.sum((phi_pi - psi_goal) ** 2, dim=-1))
-            entropy_loss = (alpha_state["value"] * log_pi).mean()
-            return entropy_loss - qf_pi.mean()
-
-        def alpha_loss(policy_input):
-            if not args.autotune:
-                return None
-            with torch.no_grad():
-                _, log_pi, _ = actor.get_action(policy_input)
-            return (-log_alpha.exp() * (log_pi + target_entropy)).mean()
-
-        policy_input = build_policy_input(state, goals_pos)
-        loss = actor_loss(policy_input)
-
-        actor_optimizer.zero_grad()
-        loss.backward()
-        if args.model_type == "packnet":
-            if global_step >= packnet_retrain_start:
-                # can be called multiple times, only the first counts
-                actor.model.start_retraining()
-            actor.model.before_update()
-        actor_optimizer.step()
-
-        alpha_loss_value = alpha_loss(policy_input)
-        if alpha_loss_value is not None:
-            a_optimizer.zero_grad()
-            alpha_loss_value.backward()
-            a_optimizer.step()
-            alpha_state["value"] = log_alpha.exp().item()
-
-        return loss, alpha_loss_value
-
-    def update_critic(state, goals_pos, actions, trajectory_ids, global_step):
-        phi = phi_encoder(state, actions)
-        psi_pos = psi_encoder(goals_pos)
-
-        # DEBUG: Check trajectory distribution and encoding diversity
-        if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
-            unique_trajectories = torch.unique(trajectory_ids)
-            print(f"=== DEBUG: Batch Analysis ===")
-            print(f"Batch size: {len(trajectory_ids)}")
-            print(f"Unique trajectories: {len(unique_trajectories)}")
-            print(f"Trajectory IDs: {trajectory_ids[:10].cpu().numpy()}")
-            print(f"Phi encoding stats - mean: {phi.mean().item():.6f}, std: {phi.std().item():.6f}")
-            print(f"Psi encoding stats - mean: {psi_pos.mean().item():.6f}, std: {psi_pos.std().item():.6f}")
-            # Check if encodings are all the same
-            phi_diff = (phi[0:1] - phi[1:2]).abs().mean().item()
-            psi_diff = (psi_pos[0:1] - psi_pos[1:2]).abs().mean().item()
-            print(f"Phi encoding difference (first 2): {phi_diff:.6f}")
-            print(f"Psi encoding difference (first 2): {psi_diff:.6f}")
-
-        # Compute similarity as negative L2 distance (as per diagram)
-        # sim_ij = -||φ(s_i, a_i) - ψ(g_j)||_2
-        phi_expanded = phi.unsqueeze(1)  # [batch_size, 1, proj_dim]
-        psi_expanded = psi_pos.unsqueeze(0)  # [1, batch_size, proj_dim]
-        distances = torch.norm(phi_expanded - psi_expanded, dim=2)  # [batch_size, batch_size]
-        logits = -distances / args.nce_temperature
-
-        logsumexp = torch.logsumexp(logits, dim=1)
-        nce_loss = -(logits.diag() - logsumexp).mean()
-        nce_loss = nce_loss + args.logsumexp_penalty_coeff * (logsumexp.pow(2).mean())
-        pos_score = logits.diag().mean().item()
-        neg_score = None
-        if logits.shape[0] > 1:
-            neg_mask = ~torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
-            neg_score = logits[neg_mask].mean().item()
-
-        critic_optimizer.zero_grad()
-        (args.nce_loss_weight * nce_loss).backward()
-        critic_optimizer.step()
-        return nce_loss, pos_score, neg_score, logits
-
-    def sgd_step(state, goals_pos, actions, trajectory_ids, global_step):
-        actor_loss, alpha_loss = update_actor(state, goals_pos, global_step)
-        nce_loss, pos_score, neg_score, logits = update_critic(
-            state, goals_pos, actions, trajectory_ids, global_step
-        )
-        return nce_loss, pos_score, neg_score, logits, actor_loss, alpha_loss
-
-    def _concat_batches(batches):
-        observations = torch.cat([b.observations.observation for b in batches], dim=0)
-        critic_goals = torch.cat([b.observations.critic_goal for b in batches], dim=0)
-        actions = torch.cat([b.actions for b in batches], dim=0)
-        trajectory_ids = torch.cat([b.trajectory_ids for b in batches], dim=0)
-        return observations, critic_goals, actions, trajectory_ids
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -801,54 +641,98 @@ if __name__ == "__main__":
                 global_step >= args.nce_start
                 and global_step % args.nce_update_freq == 0
             )
+            data = rb.sample(args.batch_size)
             nce_loss = None
             actor_loss = None
-            alpha_loss = None
             pos_score = None
             neg_score = None
 
             if update_step:
-                batches = [rb.sample(args.batch_size) for _ in range(args.num_episodes_per_env)]
-                state, goals_pos, actions, trajectory_ids = _concat_batches(batches)
-                total_samples = state.shape[0]
-                perm = torch.randperm(total_samples, device=state.device)
-                state = state[perm]
-                goals_pos = goals_pos[perm]
-                actions = actions[perm]
-                trajectory_ids = trajectory_ids[perm]
+                # Extract state and goals from buffer
+                # TrajectoryBuffer already samples future goals from same trajectory
+                state = data.observations.observation.to(device).float()
+                goals_pos = data.observations.critic_goal.to(device).float()
+                actions = data.actions.to(device).float()
+                trajectory_ids = data.trajectory_ids.to(device)
 
-                num_full_batches = total_samples // args.batch_size
-                if num_full_batches == 0:
-                    continue
-                limit = num_full_batches * args.batch_size
-                state = state[:limit]
-                goals_pos = goals_pos[:limit]
-                actions = actions[:limit]
-                trajectory_ids = trajectory_ids[:limit]
-
-                state = state.view(num_full_batches, args.batch_size, -1)
-                goals_pos = goals_pos.view(num_full_batches, args.batch_size, -1)
-                actions = actions.view(num_full_batches, args.batch_size, -1)
-                trajectory_ids = trajectory_ids.view(num_full_batches, args.batch_size)
-
-                batch_indices = torch.arange(num_full_batches, device=state.device)
-                if args.use_all_batches == 0:
-                    num_select = min(args.num_sgd_batches_per_training_step, num_full_batches)
-                    batch_indices = batch_indices[torch.randperm(num_full_batches, device=state.device)[:num_select]]
-
-                for batch_idx in batch_indices:
-                    nce_loss, pos_score, neg_score, logits, actor_loss, alpha_loss = sgd_step(
-                        state[batch_idx],
-                        goals_pos[batch_idx],
-                        actions[batch_idx],
-                        trajectory_ids[batch_idx],
-                        global_step,
+                phi = phi_encoder(state, actions)
+                psi_pos = psi_encoder(goals_pos)
+                
+                # DEBUG: Check trajectory distribution and encoding diversity
+                if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
+                    unique_trajectories = torch.unique(trajectory_ids)
+                    print(f"=== DEBUG: Batch Analysis ===")
+                    print(f"Batch size: {len(trajectory_ids)}")
+                    print(f"Unique trajectories: {len(unique_trajectories)}")
+                    print(f"Trajectory IDs: {trajectory_ids[:10].cpu().numpy()}")
+                    print(f"Phi encoding stats - mean: {phi.mean().item():.6f}, std: {phi.std().item():.6f}")
+                    print(f"Psi encoding stats - mean: {psi_pos.mean().item():.6f}, std: {psi_pos.std().item():.6f}")
+                    # Check if encodings are all the same
+                    phi_diff = (phi[0:1] - phi[1:2]).abs().mean().item()
+                    psi_diff = (psi_pos[0:1] - psi_pos[1:2]).abs().mean().item()
+                    print(f"Phi encoding difference (first 2): {phi_diff:.6f}")
+                    print(f"Psi encoding difference (first 2): {psi_diff:.6f}")
+                
+                # Compute similarity as negative L2 distance (as per diagram)
+                # sim_ij = -||φ(s_i, a_i) - ψ(g_j)||_2
+                phi_expanded = phi.unsqueeze(1)  # [batch_size, 1, proj_dim]
+                psi_expanded = psi_pos.unsqueeze(0)  # [1, batch_size, proj_dim]
+                distances = torch.norm(phi_expanded - psi_expanded, dim=2)  # [batch_size, batch_size]
+                logits = -distances / args.nce_temperature
+                
+                # Create mask to exclude same-trajectory negatives
+                # trajectory_mask[i, j] = True if trajectory_ids[i] != trajectory_ids[j] (different trajectories)
+                trajectory_mask = (trajectory_ids.unsqueeze(1) != trajectory_ids.unsqueeze(0))
+                # Keep diagonal (positive pairs) and different-trajectory pairs
+                valid_mask = trajectory_mask | torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+                
+                # DEBUG: Check masking
+                if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
+                    num_valid_per_row = valid_mask.sum(dim=1)
+                    print(f"Valid logits per row - min: {num_valid_per_row.min().item()}, max: {num_valid_per_row.max().item()}, mean: {num_valid_per_row.float().mean().item():.1f}")
+                    print(f"=================================")
+                
+                # Mask out invalid logits (same-trajectory negatives) by setting to -inf
+                masked_logits = logits.clone()
+                masked_logits[~valid_mask] = float('-inf')
+                
+                labels = torch.arange(logits.shape[0], device=logits.device)
+                nce_loss = F.cross_entropy(masked_logits, labels)
+                pos_logits = logits.diag()
+                pos_score = pos_logits.mean().item()
+                if logits.shape[0] > 1:
+                    # Only consider negatives from different trajectories
+                    neg_mask = trajectory_mask & ~torch.eye(
+                        logits.shape[0], dtype=torch.bool, device=logits.device
                     )
+                    if neg_mask.any():
+                        neg_score = logits[neg_mask].mean().item()
+                    else:
+                        neg_score = None
+
+                critic_optimizer.zero_grad()
+                (args.nce_loss_weight * nce_loss).backward()
+                critic_optimizer.step()
+
+                policy_input = build_policy_input(state, goals_pos)
+                pi, _, _ = actor.get_action(policy_input)
+                phi_pi = phi_encoder(state, pi)
+                psi_goal = psi_encoder(goals_pos).detach()
+                actor_loss = -(phi_pi * psi_goal).sum(dim=-1).mean()
+
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                if args.model_type == "packnet":
+                    if global_step >= packnet_retrain_start:
+                        # can be called multiple times, only the first counts
+                        actor.model.start_retraining()
+                    actor.model.before_update()
+                actor_optimizer.step()
                 if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
                     print("=== Encoder batch (update) ===")
-                    print("state[0]:", state[0][0].detach().cpu().numpy())
-                    print("action[0]:", actions[0][0].detach().cpu().numpy())
-                    print("goal_pos[0]:", goals_pos[0][0].detach().cpu().numpy())
+                    print("state[0]:", state[0].detach().cpu().numpy())
+                    print("action[0]:", actions[0].detach().cpu().numpy())
+                    print("goal_pos[0]:", goals_pos[0].detach().cpu().numpy())
                     row0 = logits[0].detach().cpu().numpy()
                     print("=== InfoNCE logits (row 0) ===")
                     print("pos_logit:", row0[0])
@@ -862,9 +746,6 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         "losses/actor_loss", actor_loss.item(), global_step
                     )
-                writer.add_scalar("losses/alpha", alpha_state["value"], global_step)
-                if args.autotune and alpha_loss is not None:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
                 if pos_score is not None:
                     writer.add_scalar("metrics/pos_score", pos_score, global_step)
                 if neg_score is not None:
@@ -882,9 +763,6 @@ if __name__ == "__main__":
                         log_dict["losses/nce_loss"] = nce_loss.item()
                     if actor_loss is not None:
                         log_dict["losses/actor_loss"] = actor_loss.item()
-                    log_dict["losses/alpha"] = alpha_state["value"]
-                    if args.autotune and alpha_loss is not None:
-                        log_dict["losses/alpha_loss"] = alpha_loss.item()
                     if pos_score is not None:
                         log_dict["metrics/pos_score"] = pos_score
                     if neg_score is not None:

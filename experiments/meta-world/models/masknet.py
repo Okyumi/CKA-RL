@@ -6,13 +6,18 @@ from .mask_modules import MultitaskMaskLinear, set_model_task, NEW_MASK_LINEAR_C
 
 
 class MaskNetAgent(nn.Module):
-    def __init__(self, obs_dim, act_dim, num_tasks):
+    def __init__(self, obs_dim, act_dim, num_tasks, network_width: int = 1024, network_depth: int = 4):
         super().__init__()
         self.act_dim = act_dim
         self.obs_dim = obs_dim
         self.num_tasks = num_tasks
         
-        self.fc = shared(input_dim=obs_dim)
+        self.fc = shared(
+            input_dim=obs_dim,
+            network_width=network_width,
+            network_depth=network_depth,
+        )
+        self.fc_output_dim = getattr(self.fc, "output_dim", 256)
 
         # will be created when calling `reset_heads`
         self.fc_mean = None
@@ -20,9 +25,9 @@ class MaskNetAgent(nn.Module):
         self.reset_heads()
 
     def reset_heads(self):
-        self.fc_mean = MultitaskMaskLinear(256, self.act_dim, \
+        self.fc_mean = MultitaskMaskLinear(self.fc_output_dim, self.act_dim, \
             discrete=True, num_tasks=self.num_tasks, new_mask_type=NEW_MASK_LINEAR_COMB)
-        self.fc_logstd = MultitaskMaskLinear(256, self.act_dim, \
+        self.fc_logstd = MultitaskMaskLinear(self.fc_output_dim, self.act_dim, \
             discrete=True, num_tasks=self.num_tasks, new_mask_type=NEW_MASK_LINEAR_COMB)
 
     def forward(self, x):

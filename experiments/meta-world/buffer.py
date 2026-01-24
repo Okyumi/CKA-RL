@@ -44,6 +44,7 @@ class TrajectoryBuffer:
         observation_space,
         action_space,
         device: str = "cpu",
+        num_envs: int = 1,
         episode_length: int = 500,  # Typical episode length for MetaWorld
         gamma: float = 0.99,  # Discount factor for geometric distribution
         goal_start_idx: int = 4,  # Start index for goal extraction (indices 4,5,6)
@@ -59,8 +60,10 @@ class TrajectoryBuffer:
         # Storage: list of trajectories, where each trajectory is a list of transitions
         self.trajectories: List[List[Transition]] = []
         self.episode_ids: Dict[int, int] = {}  # transition_idx -> episode_id
-        self.current_episode_id = 0
-        self.current_trajectory: List[Transition] = []
+        self.num_envs = num_envs
+        self.current_episode_ids = list(range(num_envs))
+        self.next_episode_id = num_envs
+        self.current_trajectories: List[List[Transition]] = [[] for _ in range(num_envs)]
         
         # Track buffer position for circular buffer behavior
         self.insert_position = 0
@@ -135,15 +138,38 @@ class TrajectoryBuffer:
             terminations = [terminations] if not isinstance(terminations, (list, np.ndarray)) else terminations
         
         for i in range(batch_size):
+            # Extract observation properly for dict case
+            if isinstance(obs, dict):
+                # For dict observations, extract each key's i-th element
+                obs_i = {key: val[i] if isinstance(val, (list, np.ndarray)) and len(val) > i else val 
+                        for key, val in obs.items()}
+            else:
+                obs_i = obs[i] if isinstance(obs, (list, np.ndarray)) else obs
+            
+            if isinstance(next_obs, dict):
+                next_obs_i = {key: val[i] if isinstance(val, (list, np.ndarray)) and len(val) > i else val 
+                             for key, val in next_obs.items()}
+            else:
+                next_obs_i = next_obs[i] if isinstance(next_obs, (list, np.ndarray)) else next_obs
+            
+            # Squeeze out any leading dimensions of size 1 from dict values
+            # This handles cases where arrays have shape (1, feature_dim) instead of (feature_dim,)
+            if isinstance(obs_i, dict):
+                obs_i = {key: np.squeeze(val) if isinstance(val, np.ndarray) else val 
+                        for key, val in obs_i.items()}
+            if isinstance(next_obs_i, dict):
+                next_obs_i = {key: np.squeeze(val) if isinstance(val, np.ndarray) else val 
+                             for key, val in next_obs_i.items()}
+            
             transition = Transition(
-                observation=obs[i],
+                observation=obs_i,
                 action=actions[i] if isinstance(actions, (list, np.ndarray)) else actions,
                 reward=float(rewards[i] if isinstance(rewards, (list, np.ndarray)) else rewards),
-                next_observation=next_obs[i],
+                next_observation=next_obs_i,
                 terminated=bool(terminations[i] if isinstance(terminations, (list, np.ndarray)) else terminations),
                 truncated=False,  # Will be set from infos if needed
                 info=infos[i] if i < len(infos) else {},
-                episode_id=self.current_episode_id,
+                episode_id=self.current_episode_ids[i],
             )
             
             # Check if this is a truncation
@@ -161,17 +187,18 @@ class TrajectoryBuffer:
                     if 'truncations' in infos[i]:
                         transition.truncated = bool(infos[i]['truncations'])
             
-            self.current_trajectory.append(transition)
+            self.current_trajectories[i].append(transition)
             
             # Check if episode ended
             episode_ended = transition.terminated or transition.truncated
             
             if episode_ended:
                 # Save current trajectory
-                if len(self.current_trajectory) > 0:
-                    self._add_trajectory(self.current_trajectory)
-                    self.current_trajectory = []
-                self.current_episode_id += 1
+                if len(self.current_trajectories[i]) > 0:
+                    self._add_trajectory(self.current_trajectories[i])
+                    self.current_trajectories[i] = []
+                self.current_episode_ids[i] = self.next_episode_id
+                self.next_episode_id += 1
     
     def _add_trajectory(self, trajectory: List[Transition]):
         """Add a complete trajectory to the buffer."""
@@ -223,16 +250,10 @@ class TrajectoryBuffer:
         batch_size: int,
     ) -> Dict[str, torch.Tensor]:
         """
-        Sample transitions and their corresponding future goals from the same trajectory.
-        
-        This implements the contrastive RL sampling strategy:
-        1. Sample trajectories
-        2. For each transition (s_t, a_t) in each trajectory, sample a random future state
-           from the same trajectory using geometric distribution
-        3. Extract goals from future states
+        Sample transitions by flattening trajectories with future goals.
         
         Args:
-            batch_size: Number of transitions to sample
+            batch_size: Number of samples to return
             
         Returns:
             Dictionary with keys (compatible with DictReplayBuffer format):
@@ -241,135 +262,122 @@ class TrajectoryBuffer:
             - next_observations: Dict with 'observation', 'desired_goal', 'critic_goal'
             - rewards: (batch_size,)
             - terminations: (batch_size,)
+            - trajectory_ids: (batch_size,) - IDs for tracking source trajectory
         """
         if self.size() == 0:
             raise ValueError("Cannot sample from empty buffer")
-        
-        # Sample trajectories until we have enough transitions
-        # We sample more trajectories than needed to account for variable episode lengths
-        trajectories = []
-        total_transitions = 0
-        max_trajectories = min(len(self.trajectories), 100)  # Limit to avoid infinite loop
-        
-        while total_transitions < batch_size and len(trajectories) < max_trajectories:
-            sampled = self.sample_trajectories(1)
-            if len(sampled) > 0 and len(sampled[0]) > 1:  # Need at least 2 transitions for future sampling
-                trajectories.extend(sampled)
-                total_transitions += len(sampled[0]) - 1  # -1 because last transition has no future
-        
-        # Collect transitions and their future goals
-        observations = []
-        actions = []
-        next_observations = []
-        rewards = []
-        terminations = []
-        
-        for trajectory in trajectories:
-            if len(trajectory) < 2:  # Need at least 2 transitions
-                continue
-            
-            # For each transition in trajectory, sample a future goal
-            for t in range(len(trajectory) - 1):  # Last transition has no future
-                if len(observations) >= batch_size:
-                    break
-                    
-                transition = trajectory[t]
-                
-                # Sample random future state from same trajectory using geometric distribution
-                future_idx = self._sample_future_state_idx(t, len(trajectory))
-                future_transition = trajectory[future_idx]
-                
-                # Extract goal from future state's observation
-                if isinstance(future_transition.observation, dict):
-                    # Dict observation: extract critic_goal
-                    goal = future_transition.observation.get('critic_goal', 
-                                                             future_transition.observation.get('desired_goal'))
-                else:
-                    # Flat observation: extract goal from indices [goal_start_idx:goal_end_idx]
-                    goal = future_transition.observation[self.goal_start_idx:self.goal_end_idx]
-                
-                # Build observation dict with goal from future state
-                if isinstance(transition.observation, dict):
-                    obs_dict = {
-                        'observation': transition.observation['observation'],
-                        'desired_goal': transition.observation['desired_goal'],
-                        'critic_goal': goal,  # Use goal from future state
-                    }
-                    next_obs_dict = {
-                        'observation': transition.next_observation['observation'],
-                        'desired_goal': transition.next_observation['desired_goal'],
-                        'critic_goal': goal,  # Use same goal for next_obs
-                    }
-                else:
-                    # Flat observation - reconstruct with goal
-                    state = transition.observation[:self.goal_start_idx]
-                    obs_dict = {
-                        'observation': state,
-                        'desired_goal': goal,
-                        'critic_goal': goal,
-                    }
-                    next_state = transition.next_observation[:self.goal_start_idx]
-                    next_obs_dict = {
-                        'observation': next_state,
-                        'desired_goal': goal,
-                        'critic_goal': goal,
-                    }
-                
-                observations.append(obs_dict)
-                actions.append(transition.action)
-                next_observations.append(next_obs_dict)
-                rewards.append(transition.reward)
-                terminations.append(transition.terminated)
-            
-            if len(observations) >= batch_size:
+        if len(self.trajectories) < 2:
+            raise ValueError("Need at least 2 trajectories for contrastive sampling")
+        samples = []
+        traj_indices = np.random.permutation(len(self.trajectories))
+        for traj_idx in traj_indices:
+            sample = self._sample_from_trajectory(self.trajectories[traj_idx])
+            if sample is not None:
+                samples.append(sample)
+            if len(samples) >= batch_size:
                 break
-        
-        # Truncate to batch_size
-        observations = observations[:batch_size]
-        actions = actions[:batch_size]
-        next_observations = next_observations[:batch_size]
-        rewards = rewards[:batch_size]
-        terminations = terminations[:batch_size]
-        
-        # Convert to tensors (compatible with DictReplayBuffer format)
-        def dict_to_tensor(dict_list, key):
-            """Extract a key from list of dicts and convert to tensor."""
-            values = [d[key] for d in dict_list]
-            if isinstance(values[0], np.ndarray):
-                return torch.from_numpy(np.array(values)).float()
-            elif isinstance(values[0], torch.Tensor):
-                return torch.stack(values).float()
-            else:
-                return torch.tensor(values).float()
-        
-        def to_tensor(arr_list):
-            """Convert list of arrays/tensors to single tensor."""
-            if len(arr_list) == 0:
-                return torch.empty(0)
-            if isinstance(arr_list[0], np.ndarray):
-                return torch.from_numpy(np.array(arr_list)).float()
-            elif isinstance(arr_list[0], torch.Tensor):
-                return torch.stack(arr_list).float()
-            else:
-                return torch.tensor(arr_list).float()
-        
-        # Return in DictReplayBuffer format (using a simple class for compatibility)
+
+        while len(samples) < batch_size:
+            traj_idx = np.random.randint(0, len(self.trajectories))
+            sample = self._sample_from_trajectory(self.trajectories[traj_idx])
+            if sample is not None:
+                samples.append(sample)
+
+        return self._build_batch(samples)
+
+    def _flatten_trajectory(self, trajectory: List[Transition]) -> List[Tuple[dict, dict, np.ndarray, float, bool, int]]:
+        if len(trajectory) < 2:
+            return []
+        flat = []
+        for t in range(len(trajectory) - 1):
+            transition = trajectory[t]
+            future_idx = self._sample_future_state_idx(t, len(trajectory))
+            future_transition = trajectory[future_idx]
+            goal = future_transition.observation["critic_goal"]
+            obs_dict = {
+                "observation": transition.observation["observation"],
+                "desired_goal": goal,
+                "critic_goal": goal,
+            }
+            next_obs_dict = {
+                "observation": transition.next_observation["observation"],
+                "desired_goal": goal,
+                "critic_goal": goal,
+            }
+            flat.append(
+                (
+                    obs_dict,
+                    next_obs_dict,
+                    transition.action,
+                    transition.reward,
+                    transition.terminated,
+                    transition.episode_id,
+                )
+            )
+        return flat
+
+    def _sample_from_trajectory(self, trajectory: List[Transition]):
+        if len(trajectory) < 2:
+            return None
+        t = np.random.randint(0, len(trajectory) - 1)
+        transition = trajectory[t]
+        future_idx = self._sample_future_state_idx(t, len(trajectory))
+        future_transition = trajectory[future_idx]
+        goal = future_transition.observation["critic_goal"]
+        obs_dict = {
+            "observation": transition.observation["observation"],
+            "desired_goal": goal,
+            "critic_goal": goal,
+        }
+        next_obs_dict = {
+            "observation": transition.next_observation["observation"],
+            "desired_goal": goal,
+            "critic_goal": goal,
+        }
+        return (
+            obs_dict,
+            next_obs_dict,
+            transition.action,
+            transition.reward,
+            transition.terminated,
+            transition.episode_id,
+        )
+
+    def _build_batch(self, samples):
+        observations = {
+            "observation": np.stack([s[0]["observation"] for s in samples], axis=0),
+            "desired_goal": np.stack([s[0]["desired_goal"] for s in samples], axis=0),
+            "critic_goal": np.stack([s[0]["critic_goal"] for s in samples], axis=0),
+        }
+        next_observations = {
+            "observation": np.stack([s[1]["observation"] for s in samples], axis=0),
+            "desired_goal": np.stack([s[1]["desired_goal"] for s in samples], axis=0),
+            "critic_goal": np.stack([s[1]["critic_goal"] for s in samples], axis=0),
+        }
+        actions = np.stack([s[2] for s in samples], axis=0)
+        rewards = np.array([s[3] for s in samples], dtype=np.float32)
+        terminations = np.array([s[4] for s in samples], dtype=np.bool_)
+        trajectory_ids = np.array([s[5] for s in samples], dtype=np.int64)
+
+        device = self.device
+
         class Batch:
             def __init__(self):
-                self.observations = type('Obs', (), {
-                    'observation': dict_to_tensor(observations, 'observation').to(self.device),
-                    'desired_goal': dict_to_tensor(observations, 'desired_goal').to(self.device),
-                    'critic_goal': dict_to_tensor(observations, 'critic_goal').to(self.device),
+                self.observations = type("Obs", (), {
+                    "observation": torch.as_tensor(observations["observation"], device=device, dtype=torch.float32),
+                    "desired_goal": torch.as_tensor(observations["desired_goal"], device=device, dtype=torch.float32),
+                    "critic_goal": torch.as_tensor(observations["critic_goal"], device=device, dtype=torch.float32),
                 })()
-                self.actions = to_tensor(actions).to(self.device)
-                self.next_observations = type('NextObs', (), {
-                    'observation': dict_to_tensor(next_observations, 'observation').to(self.device),
-                    'desired_goal': dict_to_tensor(next_observations, 'desired_goal').to(self.device),
-                    'critic_goal': dict_to_tensor(next_observations, 'critic_goal').to(self.device),
+                self.actions = torch.as_tensor(actions, device=device, dtype=torch.float32)
+                self.next_observations = type("NextObs", (), {
+                    "observation": torch.as_tensor(next_observations["observation"], device=device, dtype=torch.float32),
+                    "desired_goal": torch.as_tensor(next_observations["desired_goal"], device=device, dtype=torch.float32),
+                    "critic_goal": torch.as_tensor(next_observations["critic_goal"], device=device, dtype=torch.float32),
                 })()
-                self.rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-                self.terminations = torch.tensor(terminations, dtype=torch.bool).to(self.device)
-        
+                self.rewards = torch.as_tensor(rewards, device=device, dtype=torch.float32)
+                self.terminations = torch.as_tensor(terminations, device=device, dtype=torch.bool)
+                self.trajectory_ids = torch.as_tensor(trajectory_ids, device=device, dtype=torch.long)
+
         return Batch()
     
     def _sample_future_state_idx(self, current_idx: int, trajectory_length: int) -> int:
