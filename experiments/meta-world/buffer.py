@@ -44,7 +44,6 @@ class TrajectoryBuffer:
         observation_space,
         action_space,
         device: str = "cpu",
-        num_envs: int = 1,
         episode_length: int = 500,  # Typical episode length for MetaWorld
         gamma: float = 0.99,  # Discount factor for geometric distribution
         goal_start_idx: int = 4,  # Start index for goal extraction (indices 4,5,6)
@@ -60,10 +59,8 @@ class TrajectoryBuffer:
         # Storage: list of trajectories, where each trajectory is a list of transitions
         self.trajectories: List[List[Transition]] = []
         self.episode_ids: Dict[int, int] = {}  # transition_idx -> episode_id
-        self.num_envs = num_envs
-        self.current_episode_ids = list(range(num_envs))
-        self.next_episode_id = num_envs
-        self.current_trajectories: List[List[Transition]] = [[] for _ in range(num_envs)]
+        self.current_episode_id = 0
+        self.current_trajectory: List[Transition] = []
         
         # Track buffer position for circular buffer behavior
         self.insert_position = 0
@@ -99,106 +96,52 @@ class TrajectoryBuffer:
         Add transitions to the buffer.
         
         Args:
-            obs: Current observations (batch_size, obs_dim) or dict
-            next_obs: Next observations (batch_size, obs_dim) or dict
+            obs: Dict observations from GoalObsWrapper (batch_size, obs_dim)
+            next_obs: Dict next observations from GoalObsWrapper
             actions: Actions taken (batch_size, action_dim)
             rewards: Rewards received (batch_size,)
             terminations: Whether episode terminated (batch_size,)
-            infos: Info dicts from environment (dict for vectorized env, or list)
+            infos: Info dict from vectorized env (gymnasium AsyncVectorEnv)
         """
-        # Handle vectorized environment format
-        # Vectorized envs return infos as dict with keys like 'final_info', 'final_observation', etc.
-        if isinstance(infos, dict):
-            batch_size = len(obs) if isinstance(obs, (list, np.ndarray)) else 1
-            infos_list = []
-            for i in range(batch_size):
-                info_dict = {}
-                # Extract per-env info if available
-                if 'final_info' in infos and infos['final_info'] is not None:
-                    if i < len(infos['final_info']) and infos['final_info'][i] is not None:
-                        info_dict.update(infos['final_info'][i])
-                # Add other keys that might be per-env
-                for key, value in infos.items():
-                    if key not in ['final_info', 'final_observation']:
-                        if isinstance(value, (list, np.ndarray)) and len(value) > i:
-                            info_dict[key] = value[i]
-                        elif not isinstance(value, (list, np.ndarray)):
-                            info_dict[key] = value
-                infos_list.append(info_dict)
-            infos = infos_list
-        
-        batch_size = len(obs) if isinstance(obs, (list, np.ndarray)) else 1
-        
-        # Handle single vs batch observations
-        if not isinstance(obs, (list, np.ndarray)):
-            obs = [obs]
-            next_obs = [next_obs]
-            actions = [actions]
-            rewards = [rewards] if not isinstance(rewards, (list, np.ndarray)) else rewards
-            terminations = [terminations] if not isinstance(terminations, (list, np.ndarray)) else terminations
-        
+        batch_size = rewards.shape[0]
+        infos_list = []
         for i in range(batch_size):
-            # Extract observation properly for dict case
-            if isinstance(obs, dict):
-                # For dict observations, extract each key's i-th element
-                obs_i = {key: val[i] if isinstance(val, (list, np.ndarray)) and len(val) > i else val 
-                        for key, val in obs.items()}
-            else:
-                obs_i = obs[i] if isinstance(obs, (list, np.ndarray)) else obs
-            
-            if isinstance(next_obs, dict):
-                next_obs_i = {key: val[i] if isinstance(val, (list, np.ndarray)) and len(val) > i else val 
-                             for key, val in next_obs.items()}
-            else:
-                next_obs_i = next_obs[i] if isinstance(next_obs, (list, np.ndarray)) else next_obs
-            
-            # Squeeze out any leading dimensions of size 1 from dict values
-            # This handles cases where arrays have shape (1, feature_dim) instead of (feature_dim,)
-            if isinstance(obs_i, dict):
-                obs_i = {key: np.squeeze(val) if isinstance(val, np.ndarray) else val 
-                        for key, val in obs_i.items()}
-            if isinstance(next_obs_i, dict):
-                next_obs_i = {key: np.squeeze(val) if isinstance(val, np.ndarray) else val 
-                             for key, val in next_obs_i.items()}
-            
+            info_dict = {}
+            if "final_info" in infos and infos["final_info"] is not None:
+                if i < len(infos["final_info"]) and infos["final_info"][i] is not None:
+                    info_dict.update(infos["final_info"][i])
+            for key, value in infos.items():
+                if key in ["final_info", "final_observation"]:
+                    continue
+                info_dict[key] = value[i]
+            infos_list.append(info_dict)
+
+        for i in range(batch_size):
+            obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
+            next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
+
             transition = Transition(
                 observation=obs_i,
-                action=actions[i] if isinstance(actions, (list, np.ndarray)) else actions,
-                reward=float(rewards[i] if isinstance(rewards, (list, np.ndarray)) else rewards),
+                action=actions[i],
+                reward=float(rewards[i]),
                 next_observation=next_obs_i,
-                terminated=bool(terminations[i] if isinstance(terminations, (list, np.ndarray)) else terminations),
-                truncated=False,  # Will be set from infos if needed
-                info=infos[i] if i < len(infos) else {},
-                episode_id=self.current_episode_ids[i],
+                terminated=bool(terminations[i]),
+                truncated=bool(truncations[i]) if truncations is not None else False,
+                info=infos_list[i],
+                episode_id=self.current_episode_id,
             )
             
-            # Check if this is a truncation
-            if truncations is not None:
-                if isinstance(truncations, (list, np.ndarray)):
-                    transition.truncated = bool(truncations[i] if i < len(truncations) else False)
-                else:
-                    transition.truncated = bool(truncations)
-            elif i < len(infos):
-                # Check for truncation in various formats
-                if isinstance(infos[i], dict):
-                    if 'TimeLimit.truncated' in infos[i]:
-                        transition.truncated = bool(infos[i]['TimeLimit.truncated'])
-                    # Also check truncations array if present
-                    if 'truncations' in infos[i]:
-                        transition.truncated = bool(infos[i]['truncations'])
-            
-            self.current_trajectories[i].append(transition)
+            self.current_trajectory.append(transition)
             
             # Check if episode ended
             episode_ended = transition.terminated or transition.truncated
             
             if episode_ended:
                 # Save current trajectory
-                if len(self.current_trajectories[i]) > 0:
-                    self._add_trajectory(self.current_trajectories[i])
-                    self.current_trajectories[i] = []
-                self.current_episode_ids[i] = self.next_episode_id
-                self.next_episode_id += 1
+                if len(self.current_trajectory) > 0:
+                    self._add_trajectory(self.current_trajectory)
+                    self.current_trajectory = []
+                self.current_episode_id += 1
     
     def _add_trajectory(self, trajectory: List[Transition]):
         """Add a complete trajectory to the buffer."""

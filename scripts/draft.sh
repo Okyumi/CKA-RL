@@ -67,16 +67,16 @@ cd /scratch/yd2247/cka_rl/experiments/meta-world
 #     --track \
 #     --task-id 3
 
-# python run_experiments_crl.py \
-#     --algorithm masknet \
-#     --tag crl_smoketest \
-#     --seed 29 \
-#     --track \
-#     --debug True
-
 python run_experiments_crl.py \
-    --algorithm cka-rl \
-    --tag num_envs_16 \
-    --seed 35 \
-    --video-every-n-episodes 50 \
-    --task-id 3
+    --algorithm masknet \
+    --tag crl_smoketest \
+    --seed 29 \
+    --track \
+    --debug True
+
+# python run_experiments_crl.py \
+#     --algorithm cka-rl \
+#     --tag 1e8_timesteps \
+#     --seed 34 \
+#     --track \
+#     --task-id 3

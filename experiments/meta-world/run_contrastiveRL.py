@@ -64,15 +64,17 @@ class Args:
     """Evaluate the agent in determinstic mode every X timesteps"""
     num_evals: int = 10
     """Number of times to evaluate the agent"""
-    total_timesteps: int = int(1e6)
+    num_envs: int = 1
+    """number of parallel environments"""
+    total_timesteps: int = 100_000_000
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     batch_size: int = 128
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5_000
+    learning_starts: int = 512_000
     """timestep to start learning"""
-    random_actions_end: int = 10_000
+    random_actions_end: int = 512_000
     """timesteps to take actions randomly"""
     policy_lr: float = 1e-3
     """the learning rate of the policy network optimizer"""
@@ -109,8 +111,6 @@ class Args:
     """hidden width for actor shared trunk"""
     actor_network_depth: int = 16
     """depth (multiple of 4) for actor shared trunk"""
-    num_envs: int = 16
-    """number of parallel environments"""
     num_episodes_per_env: int = 1
     """number of trajectory batches sampled per training step"""
     num_sgd_batches_per_training_step: int = 1
@@ -431,7 +431,7 @@ if __name__ == "__main__":
     print(f"*** Device: {device}")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
+    envs = gym.vector.AsyncVectorEnv(
         [
             make_env(
                 args.task_id,
@@ -630,7 +630,6 @@ if __name__ == "__main__":
         observation_space=envs.single_observation_space,
         action_space=envs.single_action_space,
         device=device,
-        num_envs=envs.num_envs,
         episode_length=500,  # Typical MetaWorld episode length
         gamma=0.99,  # Discount factor for geometric distribution
         goal_start_idx=4,  # Goal indices [4, 5, 6] for MetaWorld
