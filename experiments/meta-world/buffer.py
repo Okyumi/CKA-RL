@@ -61,6 +61,8 @@ class TrajectoryBuffer:
         self.episode_ids: Dict[int, int] = {}  # transition_idx -> episode_id
         self.current_episode_id = 0
         self.current_trajectory: List[Transition] = []
+        self.current_trajectory_per_env: Optional[List[List[Transition]]] = None
+        self.current_episode_id_per_env: Optional[List[int]] = None
         
         # Track buffer position for circular buffer behavior
         self.insert_position = 0
@@ -116,32 +118,68 @@ class TrajectoryBuffer:
                 info_dict[key] = value[i]
             infos_list.append(info_dict)
 
-        for i in range(batch_size):
-            obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
-            next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
+        if batch_size == 1:
+            for i in range(batch_size):
+                obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
+                next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
 
-            transition = Transition(
-                observation=obs_i,
-                action=actions[i],
-                reward=float(rewards[i]),
-                next_observation=next_obs_i,
-                terminated=bool(terminations[i]),
-                truncated=bool(truncations[i]) if truncations is not None else False,
-                info=infos_list[i],
-                episode_id=self.current_episode_id,
-            )
-            
-            self.current_trajectory.append(transition)
-            
-            # Check if episode ended
-            episode_ended = transition.terminated or transition.truncated
-            
-            if episode_ended:
-                # Save current trajectory
-                if len(self.current_trajectory) > 0:
-                    self._add_trajectory(self.current_trajectory)
-                    self.current_trajectory = []
-                self.current_episode_id += 1
+                transition = Transition(
+                    observation=obs_i,
+                    action=actions[i],
+                    reward=float(rewards[i]),
+                    next_observation=next_obs_i,
+                    terminated=bool(terminations[i]),
+                    truncated=bool(truncations[i]) if truncations is not None else False,
+                    info=infos_list[i],
+                    episode_id=self.current_episode_id,
+                )
+                
+                self.current_trajectory.append(transition)
+                
+                # Check if episode ended
+                episode_ended = transition.terminated or transition.truncated
+                
+                if episode_ended:
+                    # Save current trajectory
+                    if len(self.current_trajectory) > 0:
+                        self._add_trajectory(self.current_trajectory)
+                        self.current_trajectory = []
+                    self.current_episode_id += 1
+        else:
+            if (
+                self.current_trajectory_per_env is None
+                or self.current_episode_id_per_env is None
+                or len(self.current_trajectory_per_env) != batch_size
+            ):
+                self.current_trajectory_per_env = [[] for _ in range(batch_size)]
+                self.current_episode_id_per_env = [
+                    self.current_episode_id + i for i in range(batch_size)
+                ]
+                self.current_episode_id += batch_size
+            for i in range(batch_size):
+                obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
+                next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
+
+                transition = Transition(
+                    observation=obs_i,
+                    action=actions[i],
+                    reward=float(rewards[i]),
+                    next_observation=next_obs_i,
+                    terminated=bool(terminations[i]),
+                    truncated=bool(truncations[i]) if truncations is not None else False,
+                    info=infos_list[i],
+                    episode_id=self.current_episode_id_per_env[i],
+                )
+
+                self.current_trajectory_per_env[i].append(transition)
+
+                episode_ended = transition.terminated or transition.truncated
+                if episode_ended:
+                    if len(self.current_trajectory_per_env[i]) > 0:
+                        self._add_trajectory(self.current_trajectory_per_env[i])
+                        self.current_trajectory_per_env[i] = []
+                    self.current_episode_id_per_env[i] = self.current_episode_id
+                    self.current_episode_id += 1
     
     def _add_trajectory(self, trajectory: List[Transition]):
         """Add a complete trajectory to the buffer."""
@@ -225,6 +263,41 @@ class TrajectoryBuffer:
             sample = self._sample_from_trajectory(self.trajectories[traj_idx])
             if sample is not None:
                 samples.append(sample)
+
+        return self._build_batch(samples)
+
+    def sample_dense_pool(self, num_episodes: int) -> Any:
+        """
+        Sample dense (k-1) relabeled tuples from a set of trajectories.
+        
+        Returns all generated tuples (not capped by batch_size).
+        """
+        if self.size() == 0:
+            raise ValueError("Cannot sample from empty buffer")
+        if len(self.trajectories) == 0:
+            raise ValueError("No trajectories available for dense sampling")
+        if num_episodes <= 0:
+            raise ValueError("num_episodes must be positive")
+
+        available_trajectories = len(self.trajectories)
+        replace = available_trajectories < num_episodes
+        max_attempts = max(1, num_episodes * 3)
+        samples: List[Tuple[dict, dict, np.ndarray, float, bool, int]] = []
+
+        for _ in range(max_attempts):
+            indices = np.random.choice(
+                available_trajectories, size=num_episodes, replace=replace
+            )
+            samples = []
+            for traj_idx in indices:
+                flat = self._flatten_trajectory(self.trajectories[traj_idx])
+                if flat:
+                    samples.extend(flat)
+            if len(samples) > 0:
+                break
+
+        if len(samples) == 0:
+            raise ValueError("Dense pool sampling failed: no valid trajectories found")
 
         return self._build_batch(samples)
 

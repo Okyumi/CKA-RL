@@ -66,15 +66,15 @@ class Args:
     """Number of times to evaluate the agent"""
     num_envs: int = 1
     """number of parallel environments"""
-    total_timesteps: int = 100_000_000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     batch_size: int = 128
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 512_000
+    learning_starts: int = 50000
     """timestep to start learning"""
-    random_actions_end: int = 512_000
+    random_actions_end: int = 50000
     """timesteps to take actions randomly"""
     policy_lr: float = 1e-3
     """the learning rate of the policy network optimizer"""
@@ -105,6 +105,18 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
+    nce_episodes_per_update: int = 64
+    """number of trajectories to sample for dense relabeling"""
+    max_per_episode_in_minibatch: int = 2
+    """cap on samples per episode per minibatch"""
+    goal_bank_size: int = 8192
+    """FIFO goal bank capacity (goal embeddings)"""
+    goal_bank_warmup: int = 0
+    """steps before using goal bank (0 = no warmup)"""
+    target_utd: float = 0.045
+    """target updates-to-data ratio (SGD steps per env step)"""
+    max_update_budget: int = 10
+    """cap on accumulated SGD steps to prevent bursts"""
     logsumexp_penalty_coeff: float = 1e-3
     """logsumexp regularization coefficient for critic loss"""
     actor_network_width: int = 1024
@@ -163,6 +175,99 @@ def split_obs_and_goal(obs):
 def build_policy_input(state, actor_goal):
     return _concat_last_dim([state, actor_goal])
 
+
+class GoalBank:
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = max(0, int(capacity))
+        self.device = device
+        self._embeddings: Optional[torch.Tensor] = None
+
+    def get(self) -> Optional[torch.Tensor]:
+        if self._embeddings is None or self._embeddings.numel() == 0:
+            return None
+        return self._embeddings
+
+    def enqueue(self, embeddings: torch.Tensor) -> None:
+        if self.capacity <= 0:
+            return
+        if embeddings is None or embeddings.numel() == 0:
+            return
+        embeddings = embeddings.detach().to(self.device)
+        if embeddings.dim() == 1:
+            embeddings = embeddings.unsqueeze(0)
+        if self._embeddings is None:
+            self._embeddings = embeddings[-self.capacity :]
+            return
+        self._embeddings = torch.cat([self._embeddings, embeddings], dim=0)
+        if self._embeddings.shape[0] > self.capacity:
+            self._embeddings = self._embeddings[-self.capacity :]
+
+
+def make_episode_mixed_minibatches(
+    trajectory_ids: torch.LongTensor,
+    batch_size: int,
+    max_per_episode: int,
+) -> list:
+    if batch_size <= 0:
+        return []
+    if max_per_episode <= 0:
+        max_per_episode = 1
+
+    episode_to_indices = {}
+    for idx, episode_id in enumerate(trajectory_ids.tolist()):
+        if episode_id not in episode_to_indices:
+            episode_to_indices[episode_id] = []
+        episode_to_indices[episode_id].append(idx)
+
+    for indices in episode_to_indices.values():
+        random.shuffle(indices)
+
+    episode_ids = list(episode_to_indices.keys())
+    random.shuffle(episode_ids)
+
+    remaining = sum(len(v) for v in episode_to_indices.values())
+    batches = []
+
+    while remaining >= batch_size:
+        batch = []
+        per_episode_count = {eid: 0 for eid in episode_ids}
+
+        made_progress = True
+        while len(batch) < batch_size and made_progress:
+            made_progress = False
+            for eid in episode_ids:
+                if len(batch) >= batch_size:
+                    break
+                if per_episode_count[eid] >= max_per_episode:
+                    continue
+                indices = episode_to_indices[eid]
+                if indices:
+                    batch.append(indices.pop())
+                    per_episode_count[eid] += 1
+                    remaining -= 1
+                    made_progress = True
+
+        while len(batch) < batch_size:
+            made_progress = False
+            for eid in episode_ids:
+                if len(batch) >= batch_size:
+                    break
+                indices = episode_to_indices[eid]
+                if indices:
+                    batch.append(indices.pop())
+                    remaining -= 1
+                    made_progress = True
+            if not made_progress:
+                break
+
+        if len(batch) < batch_size:
+            break
+
+        batches.append(
+            torch.tensor(batch, device=trajectory_ids.device, dtype=torch.long)
+        )
+
+    return batches
 
 
 
@@ -444,6 +549,14 @@ if __name__ == "__main__":
             for _ in range(args.num_envs)
         ]
     )
+    eval_env = make_env(
+        args.task_id,
+        False,
+        f"{args.tag}/{run_name}",
+        args.video_every_n_episodes,
+        args.video_dir,
+        augment_goal=True,
+    )()
 
     # select the model to use as the agent
     state_dim, goal_dim, critic_goal_dim = get_state_goal_dims(
@@ -635,8 +748,12 @@ if __name__ == "__main__":
         goal_start_idx=4,  # Goal indices [4, 5, 6] for MetaWorld
         goal_end_idx=7,
     )
+    goal_bank = GoalBank(capacity=args.goal_bank_size, device=device)
 
     start_time = time.time()
+    update_budget = 0.0
+    total_sgd_steps = 0
+    total_sgd_samples = 0
 
     def update_actor(state, goals_pos, global_step):
         def actor_loss(policy_input):
@@ -678,6 +795,11 @@ if __name__ == "__main__":
     def update_critic(state, goals_pos, actions, trajectory_ids, global_step):
         phi = phi_encoder(state, actions)
         psi_pos = psi_encoder(goals_pos)
+        psi_all = psi_pos
+        if global_step >= args.goal_bank_warmup:
+            bank_embeddings = goal_bank.get()
+            if bank_embeddings is not None:
+                psi_all = torch.cat([psi_pos, bank_embeddings], dim=0)
 
         # DEBUG: Check trajectory distribution and encoding diversity
         if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
@@ -697,22 +819,26 @@ if __name__ == "__main__":
         # Compute similarity as negative L2 distance (as per diagram)
         # sim_ij = -||φ(s_i, a_i) - ψ(g_j)||_2
         phi_expanded = phi.unsqueeze(1)  # [batch_size, 1, proj_dim]
-        psi_expanded = psi_pos.unsqueeze(0)  # [1, batch_size, proj_dim]
-        distances = torch.norm(phi_expanded - psi_expanded, dim=2)  # [batch_size, batch_size]
+        psi_expanded = psi_all.unsqueeze(0)  # [1, batch_size+Q, proj_dim]
+        distances = torch.norm(phi_expanded - psi_expanded, dim=2)  # [batch_size, batch_size+Q]
         logits = -distances / args.nce_temperature
 
         logsumexp = torch.logsumexp(logits, dim=1)
-        nce_loss = -(logits.diag() - logsumexp).mean()
+        batch_size = logits.shape[0]
+        pos_logits = logits[:, :batch_size].diag()
+        nce_loss = -(pos_logits - logsumexp).mean()
         nce_loss = nce_loss + args.logsumexp_penalty_coeff * (logsumexp.pow(2).mean())
-        pos_score = logits.diag().mean().item()
+        pos_score = pos_logits.mean().item()
         neg_score = None
-        if logits.shape[0] > 1:
-            neg_mask = ~torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+        if logits.shape[1] > 1:
+            neg_mask = torch.ones_like(logits, dtype=torch.bool)
+            neg_mask[torch.arange(batch_size), torch.arange(batch_size)] = False
             neg_score = logits[neg_mask].mean().item()
 
         critic_optimizer.zero_grad()
         (args.nce_loss_weight * nce_loss).backward()
         critic_optimizer.step()
+        goal_bank.enqueue(psi_pos)
         return nce_loss, pos_score, neg_score, logits
 
     def sgd_step(state, goals_pos, actions, trajectory_ids, global_step):
@@ -788,7 +914,8 @@ if __name__ == "__main__":
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+                for key in real_next_obs:
+                    real_next_obs[key][idx] = infos["final_observation"][idx][key]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos, truncations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -796,6 +923,10 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
+            if args.target_utd > 0:
+                update_budget = min(
+                    update_budget + args.target_utd, float(args.max_update_budget)
+                )
             update_step = (
                 global_step >= args.nce_start
                 and global_step % args.nce_update_freq == 0
@@ -807,47 +938,63 @@ if __name__ == "__main__":
             neg_score = None
 
             if update_step:
-                batches = [rb.sample(args.batch_size) for _ in range(args.num_episodes_per_env)]
-                state, goals_pos, actions, trajectory_ids = _concat_batches(batches)
+                pool = rb.sample_dense_pool(args.nce_episodes_per_update)
+                state = pool.observations.observation
+                goals_pos = pool.observations.critic_goal
+                actions = pool.actions
+                trajectory_ids = pool.trajectory_ids
+
                 total_samples = state.shape[0]
+                if total_samples < args.batch_size:
+                    continue
                 perm = torch.randperm(total_samples, device=state.device)
                 state = state[perm]
                 goals_pos = goals_pos[perm]
                 actions = actions[perm]
                 trajectory_ids = trajectory_ids[perm]
 
-                num_full_batches = total_samples // args.batch_size
-                if num_full_batches == 0:
+                minibatches = make_episode_mixed_minibatches(
+                    trajectory_ids, args.batch_size, args.max_per_episode_in_minibatch
+                )
+                if len(minibatches) == 0:
                     continue
-                limit = num_full_batches * args.batch_size
-                state = state[:limit]
-                goals_pos = goals_pos[:limit]
-                actions = actions[:limit]
-                trajectory_ids = trajectory_ids[:limit]
 
-                state = state.view(num_full_batches, args.batch_size, -1)
-                goals_pos = goals_pos.view(num_full_batches, args.batch_size, -1)
-                actions = actions.view(num_full_batches, args.batch_size, -1)
-                trajectory_ids = trajectory_ids.view(num_full_batches, args.batch_size)
-
-                batch_indices = torch.arange(num_full_batches, device=state.device)
                 if args.use_all_batches == 0:
-                    num_select = min(args.num_sgd_batches_per_training_step, num_full_batches)
-                    batch_indices = batch_indices[torch.randperm(num_full_batches, device=state.device)[:num_select]]
+                    num_select = min(
+                        args.num_sgd_batches_per_training_step, len(minibatches)
+                    )
+                    select_idx = torch.randperm(len(minibatches), device=state.device)[
+                        :num_select
+                    ]
+                    minibatches = [minibatches[i] for i in select_idx.tolist()]
 
-                for batch_idx in batch_indices:
+                if args.target_utd > 0:
+                    budgeted = int(update_budget)
+                    if budgeted <= 0:
+                        continue
+                    if budgeted < len(minibatches):
+                        select_idx = torch.randperm(len(minibatches), device=state.device)[
+                            :budgeted
+                        ]
+                        minibatches = [minibatches[i] for i in select_idx.tolist()]
+
+                for batch_indices in minibatches:
                     nce_loss, pos_score, neg_score, logits, actor_loss, alpha_loss = sgd_step(
-                        state[batch_idx],
-                        goals_pos[batch_idx],
-                        actions[batch_idx],
-                        trajectory_ids[batch_idx],
+                        state[batch_indices],
+                        goals_pos[batch_indices],
+                        actions[batch_indices],
+                        trajectory_ids[batch_indices],
                         global_step,
                     )
+                if args.target_utd > 0:
+                    update_budget = max(0.0, update_budget - len(minibatches))
+                total_sgd_steps += len(minibatches)
+                total_sgd_samples += len(minibatches) * args.batch_size
                 if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
                     print("=== Encoder batch (update) ===")
-                    print("state[0]:", state[0][0].detach().cpu().numpy())
-                    print("action[0]:", actions[0][0].detach().cpu().numpy())
-                    print("goal_pos[0]:", goals_pos[0][0].detach().cpu().numpy())
+                    print("state[0]:", state[0].detach().cpu().numpy())
+                    print("action[0]:", actions[0].detach().cpu().numpy())
+                    print("goal_pos[0]:", goals_pos[0].detach().cpu().numpy())
                     row0 = logits[0].detach().cpu().numpy()
                     print("=== InfoNCE logits (row 0) ===")
                     print("pos_logit:", row0[0])
@@ -855,6 +1002,10 @@ if __name__ == "__main__":
                     print("nce_loss:", nce_loss.item())
 
             if global_step % 100 == 0:
+                total_env_steps = (global_step + 1) * envs.num_envs
+                utd_actual = total_sgd_steps / max(1, global_step + 1)
+                reuse_per_transition = total_sgd_samples / max(1, rb.size())
+                reuse_per_env_step = total_sgd_samples / max(1, total_env_steps)
                 if nce_loss is not None:
                     writer.add_scalar("losses/nce_loss", nce_loss.item(), global_step)
                 if actor_loss is not None:
@@ -868,6 +1019,14 @@ if __name__ == "__main__":
                     writer.add_scalar("metrics/pos_score", pos_score, global_step)
                 if neg_score is not None:
                     writer.add_scalar("metrics/neg_score", neg_score, global_step)
+                writer.add_scalar("metrics/utd_actual", utd_actual, global_step)
+                writer.add_scalar("metrics/utd_target", args.target_utd, global_step)
+                writer.add_scalar(
+                    "metrics/reuse_per_transition", reuse_per_transition, global_step
+                )
+                writer.add_scalar(
+                    "metrics/reuse_per_env_step", reuse_per_env_step, global_step
+                )
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
@@ -876,6 +1035,10 @@ if __name__ == "__main__":
                 if args.track:
                     log_dict = {
                         "charts/SPS": int(global_step / (time.time() - start_time)),
+                        "metrics/utd_actual": utd_actual,
+                        "metrics/utd_target": args.target_utd,
+                        "metrics/reuse_per_transition": reuse_per_transition,
+                        "metrics/reuse_per_env_step": reuse_per_env_step,
                     }
                     if nce_loss is not None:
                         log_dict["losses/nce_loss"] = nce_loss.item()
@@ -892,12 +1055,10 @@ if __name__ == "__main__":
             if args.model_type == 'cbpnet':
                 # print("cbpnet: selective initailization")
                 GnT.gen_and_test(actor.model.fc.get_activations())
-    [
-        eval_agent(actor, envs.envs[i], args.num_evals, global_step, writer, device)
-        for i in range(envs.num_envs)
-    ]
+    eval_agent(actor, eval_env, args.num_evals, global_step, writer, device)
 
     envs.close()
+    eval_env.close()
     writer.close()
     if args.track and args.capture_video:
         video_path = os.path.join(args.video_dir, args.tag, run_name)
