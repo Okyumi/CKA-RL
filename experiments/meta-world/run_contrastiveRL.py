@@ -64,7 +64,7 @@ class Args:
     """Evaluate the agent in determinstic mode every X timesteps"""
     num_evals: int = 10
     """Number of times to evaluate the agent"""
-    num_envs: int = 1
+    num_envs: int = 4
     """number of parallel environments"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -105,6 +105,8 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
+    unroll_length: int = 1
+    """number of env steps to collect per insert"""
     nce_episodes_per_update: int = 64
     """number of trajectories to sample for dense relabeling"""
     max_per_episode_in_minibatch: int = 2
@@ -857,79 +859,146 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in tqdm(range(args.total_timesteps)):
-        # ALGO LOGIC: put action logic here
-        if global_step < args.random_actions_end:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
-            )
-        else:
-            state, actor_goal, _ = split_obs_and_goal(obs)
-            policy_input = build_policy_input(state, actor_goal)
-            policy_input = torch.Tensor(policy_input).to(device)
-            if args.model_type == "componet" and global_step % 1000 == 0:
-                actions, _, _ = actor.get_action(
-                    policy_input,
-                    writer=writer,
-                    global_step=global_step,
+    total_env_steps = args.total_timesteps
+    unroll_length = max(1, args.unroll_length)
+    total_iterations = max(
+        1, math.ceil(total_env_steps / (envs.num_envs * unroll_length))
+    )
+    env_steps = 0
+    for _ in tqdm(range(total_iterations)):
+        if env_steps >= total_env_steps:
+            break
+        obs_batch = {key: [] for key in obs.keys()}
+        next_obs_batch = {key: [] for key in obs.keys()}
+        actions_batch = []
+        rewards_batch = []
+        terminations_batch = []
+        truncations_batch = []
+        infos_batch = []
+        steps_in_chunk = 0
+
+        for _ in range(unroll_length):
+            if env_steps >= total_env_steps:
+                break
+            global_step = env_steps
+            # ALGO LOGIC: put action logic here
+            if global_step < args.random_actions_end:
+                actions = np.array(
+                    [envs.single_action_space.sample() for _ in range(envs.num_envs)]
                 )
             else:
-                actions, _, _ = actor.get_action(policy_input)
-            actions = actions.detach().cpu().numpy()
-            if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
-                print("=== Actor input (step) ===")
-                print("state[0]:", np.asarray(state)[0] if np.asarray(state).ndim > 1 else np.asarray(state))
-                if actor_goal is None:
-                    print("goal: None (dummy used for policy input)")
+                state, actor_goal, _ = split_obs_and_goal(obs)
+                policy_input = build_policy_input(state, actor_goal)
+                policy_input = torch.Tensor(policy_input).to(device)
+                if args.model_type == "componet" and global_step % 1000 == 0:
+                    actions, _, _ = actor.get_action(
+                        policy_input,
+                        writer=writer,
+                        global_step=global_step,
+                    )
                 else:
-                    print("goal[0]:", np.asarray(actor_goal)[0] if np.asarray(actor_goal).ndim > 1 else np.asarray(actor_goal))
-                print("action[0]:", actions[0] if actions.ndim > 1 else actions)
+                    actions, _, _ = actor.get_action(policy_input)
+                actions = actions.detach().cpu().numpy()
+                if (
+                    args.debug_print_interval > 0
+                    and global_step % args.debug_print_interval == 0
+                ):
+                    print("=== Actor input (step) ===")
+                    print(
+                        "state[0]:",
+                        np.asarray(state)[0]
+                        if np.asarray(state).ndim > 1
+                        else np.asarray(state),
+                    )
+                    if actor_goal is None:
+                        print("goal: None (dummy used for policy input)")
+                    else:
+                        print(
+                            "goal[0]:",
+                            np.asarray(actor_goal)[0]
+                            if np.asarray(actor_goal).ndim > 1
+                            else np.asarray(actor_goal),
+                        )
+                    print("action[0]:", actions[0] if actions.ndim > 1 else actions)
 
-        # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+            # TRY NOT TO MODIFY: execute the game and log data.
+            next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for i, info in enumerate(infos["final_info"]):
-                # print(
-                #     f"global_step={global_step}, episodic_return={info['episode']['r']}, success={info['success']}"
-                # )
-                writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"], global_step
-                )
-                writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"], global_step
-                )
-                writer.add_scalar("charts/success", info["success"], global_step)
-                if args.track:
-                    wandb.log({
-                        "charts/episodic_return": info["episode"]["r"],
-                        "charts/episodic_length": info["episode"]["l"],
-                        "charts/success": info["success"],
-                    }, step=global_step)
+            # TRY NOT TO MODIFY: record rewards for plotting purposes
+            if "final_info" in infos:
+                for i, info in enumerate(infos["final_info"]):
+                    writer.add_scalar(
+                        "charts/episodic_return", info["episode"]["r"], global_step
+                    )
+                    writer.add_scalar(
+                        "charts/episodic_length", info["episode"]["l"], global_step
+                    )
+                    writer.add_scalar("charts/success", info["success"], global_step)
+                    if args.track:
+                        wandb.log(
+                            {
+                                "charts/episodic_return": info["episode"]["r"],
+                                "charts/episodic_length": info["episode"]["l"],
+                                "charts/success": info["success"],
+                            },
+                            step=global_step,
+                        )
+                    break
 
-                break
+            # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+            real_next_obs = next_obs.copy()
+            for idx, trunc in enumerate(truncations):
+                if trunc:
+                    for key in real_next_obs:
+                        real_next_obs[key][idx] = infos["final_observation"][idx][key]
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                for key in real_next_obs:
-                    real_next_obs[key][idx] = infos["final_observation"][idx][key]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos, truncations)
+            for key in obs_batch:
+                obs_batch[key].append(obs[key])
+                next_obs_batch[key].append(real_next_obs[key])
+            actions_batch.append(actions)
+            rewards_batch.append(rewards)
+            terminations_batch.append(terminations)
+            truncations_batch.append(truncations)
+            infos_batch.append(infos)
 
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-        obs = next_obs
+            # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+            obs = next_obs
+            env_steps += envs.num_envs
+            steps_in_chunk += 1
+
+        if steps_in_chunk == 0:
+            break
+
+        obs_batch = {key: np.stack(vals, axis=0) for key, vals in obs_batch.items()}
+        next_obs_batch = {
+            key: np.stack(vals, axis=0) for key, vals in next_obs_batch.items()
+        }
+        actions_batch = np.stack(actions_batch, axis=0)
+        rewards_batch = np.stack(rewards_batch, axis=0)
+        terminations_batch = np.stack(terminations_batch, axis=0)
+        truncations_batch = np.stack(truncations_batch, axis=0)
+        rb.add(
+            obs_batch,
+            next_obs_batch,
+            actions_batch,
+            rewards_batch,
+            terminations_batch,
+            infos_batch,
+            truncations_batch,
+        )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        if env_steps > args.learning_starts:
             if args.target_utd > 0:
                 update_budget = min(
-                    update_budget + args.target_utd, float(args.max_update_budget)
+                    update_budget + args.target_utd * steps_in_chunk * envs.num_envs,
+                    float(args.max_update_budget),
                 )
+            prev_env_steps = env_steps - steps_in_chunk * envs.num_envs
             update_step = (
-                global_step >= args.nce_start
-                and global_step % args.nce_update_freq == 0
+                env_steps >= args.nce_start
+                and (env_steps // args.nce_update_freq)
+                > (prev_env_steps // args.nce_update_freq)
             )
             nce_loss = None
             actor_loss = None
@@ -984,13 +1053,16 @@ if __name__ == "__main__":
                         goals_pos[batch_indices],
                         actions[batch_indices],
                         trajectory_ids[batch_indices],
-                        global_step,
+                        env_steps,
                     )
                 if args.target_utd > 0:
                     update_budget = max(0.0, update_budget - len(minibatches))
                 total_sgd_steps += len(minibatches)
                 total_sgd_samples += len(minibatches) * args.batch_size
-                if args.debug_print_interval > 0 and global_step % args.debug_print_interval == 0:
+                if (
+                    args.debug_print_interval > 0
+                    and env_steps % args.debug_print_interval == 0
+                ):
                     print("=== Encoder batch (update) ===")
                     print("state[0]:", state[0].detach().cpu().numpy())
                     print("action[0]:", actions[0].detach().cpu().numpy())
@@ -1001,40 +1073,40 @@ if __name__ == "__main__":
                     print("neg_logits:", row0[1: min(6, len(row0))])
                     print("nce_loss:", nce_loss.item())
 
-            if global_step % 100 == 0:
-                total_env_steps = (global_step + 1) * envs.num_envs
-                utd_actual = total_sgd_steps / max(1, global_step + 1)
+            if env_steps % 100 == 0:
+                current_env_steps = env_steps
+                utd_actual = total_sgd_steps / max(1, current_env_steps)
                 reuse_per_transition = total_sgd_samples / max(1, rb.size())
-                reuse_per_env_step = total_sgd_samples / max(1, total_env_steps)
+                reuse_per_env_step = total_sgd_samples / max(1, current_env_steps)
                 if nce_loss is not None:
-                    writer.add_scalar("losses/nce_loss", nce_loss.item(), global_step)
+                    writer.add_scalar("losses/nce_loss", nce_loss.item(), env_steps)
                 if actor_loss is not None:
                     writer.add_scalar(
-                        "losses/actor_loss", actor_loss.item(), global_step
+                        "losses/actor_loss", actor_loss.item(), env_steps
                     )
-                writer.add_scalar("losses/alpha", alpha_state["value"], global_step)
+                writer.add_scalar("losses/alpha", alpha_state["value"], env_steps)
                 if args.autotune and alpha_loss is not None:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), env_steps)
                 if pos_score is not None:
-                    writer.add_scalar("metrics/pos_score", pos_score, global_step)
+                    writer.add_scalar("metrics/pos_score", pos_score, env_steps)
                 if neg_score is not None:
-                    writer.add_scalar("metrics/neg_score", neg_score, global_step)
-                writer.add_scalar("metrics/utd_actual", utd_actual, global_step)
-                writer.add_scalar("metrics/utd_target", args.target_utd, global_step)
+                    writer.add_scalar("metrics/neg_score", neg_score, env_steps)
+                writer.add_scalar("metrics/utd_actual", utd_actual, env_steps)
+                writer.add_scalar("metrics/utd_target", args.target_utd, env_steps)
                 writer.add_scalar(
-                    "metrics/reuse_per_transition", reuse_per_transition, global_step
+                    "metrics/reuse_per_transition", reuse_per_transition, env_steps
                 )
                 writer.add_scalar(
-                    "metrics/reuse_per_env_step", reuse_per_env_step, global_step
+                    "metrics/reuse_per_env_step", reuse_per_env_step, env_steps
                 )
                 writer.add_scalar(
                     "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
+                    int(env_steps / (time.time() - start_time)),
+                    env_steps,
                 )
                 if args.track:
                     log_dict = {
-                        "charts/SPS": int(global_step / (time.time() - start_time)),
+                        "charts/SPS": int(env_steps / (time.time() - start_time)),
                         "metrics/utd_actual": utd_actual,
                         "metrics/utd_target": args.target_utd,
                         "metrics/reuse_per_transition": reuse_per_transition,
@@ -1051,7 +1123,7 @@ if __name__ == "__main__":
                         log_dict["metrics/pos_score"] = pos_score
                     if neg_score is not None:
                         log_dict["metrics/neg_score"] = neg_score
-                    wandb.log(log_dict, step=global_step)
+                    wandb.log(log_dict, step=env_steps)
             if args.model_type == 'cbpnet':
                 # print("cbpnet: selective initailization")
                 GnT.gen_and_test(actor.model.fc.get_activations())

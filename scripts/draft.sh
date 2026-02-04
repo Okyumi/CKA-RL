@@ -84,6 +84,6 @@ cd /scratch/yd2247/cka_rl/experiments/meta-world
 python run_experiments_crl.py \
     --algorithm simple \
     --tag 1e6_timesteps \
-    --seed 34 \
+    --seed 20 \
     --track \
     --task-id 3

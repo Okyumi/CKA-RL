@@ -105,81 +105,131 @@ class TrajectoryBuffer:
             terminations: Whether episode terminated (batch_size,)
             infos: Info dict from vectorized env (gymnasium AsyncVectorEnv)
         """
-        batch_size = rewards.shape[0]
-        infos_list = []
-        for i in range(batch_size):
-            info_dict = {}
-            if "final_info" in infos and infos["final_info"] is not None:
-                if i < len(infos["final_info"]) and infos["final_info"][i] is not None:
-                    info_dict.update(infos["final_info"][i])
-            for key, value in infos.items():
-                if key in ["final_info", "final_observation"]:
-                    continue
-                info_dict[key] = value[i]
-            infos_list.append(info_dict)
+        def _format_infos(step_infos, step_batch_size):
+            infos_list = []
+            for i in range(step_batch_size):
+                info_dict = {}
+                if "final_info" in step_infos and step_infos["final_info"] is not None:
+                    if (
+                        i < len(step_infos["final_info"])
+                        and step_infos["final_info"][i] is not None
+                    ):
+                        info_dict.update(step_infos["final_info"][i])
+                for key, value in step_infos.items():
+                    if key in ["final_info", "final_observation"]:
+                        continue
+                    info_dict[key] = value[i]
+                infos_list.append(info_dict)
+            return infos_list
 
-        if batch_size == 1:
-            for i in range(batch_size):
-                obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
-                next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
+        def _add_step(step_obs, step_next_obs, step_actions, step_rewards, step_terminations, step_infos, step_truncations):
+            step_batch_size = step_rewards.shape[0]
+            step_infos_list = _format_infos(step_infos, step_batch_size)
 
-                transition = Transition(
-                    observation=obs_i,
-                    action=actions[i],
-                    reward=float(rewards[i]),
-                    next_observation=next_obs_i,
-                    terminated=bool(terminations[i]),
-                    truncated=bool(truncations[i]) if truncations is not None else False,
-                    info=infos_list[i],
-                    episode_id=self.current_episode_id,
+            if step_batch_size == 1:
+                for i in range(step_batch_size):
+                    obs_i = {key: np.squeeze(val[i]) for key, val in step_obs.items()}
+                    next_obs_i = {
+                        key: np.squeeze(val[i]) for key, val in step_next_obs.items()
+                    }
+
+                    transition = Transition(
+                        observation=obs_i,
+                        action=step_actions[i],
+                        reward=float(step_rewards[i]),
+                        next_observation=next_obs_i,
+                        terminated=bool(step_terminations[i]),
+                        truncated=bool(step_truncations[i])
+                        if step_truncations is not None
+                        else False,
+                        info=step_infos_list[i],
+                        episode_id=self.current_episode_id,
+                    )
+
+                    self.current_trajectory.append(transition)
+
+                    # Check if episode ended
+                    episode_ended = transition.terminated or transition.truncated
+
+                    if episode_ended:
+                        # Save current trajectory
+                        if len(self.current_trajectory) > 0:
+                            self._add_trajectory(self.current_trajectory)
+                            self.current_trajectory = []
+                        self.current_episode_id += 1
+            else:
+                if (
+                    self.current_trajectory_per_env is None
+                    or self.current_episode_id_per_env is None
+                ):
+                    self.current_trajectory_per_env = [
+                        [] for _ in range(step_batch_size)
+                    ]
+                    self.current_episode_id_per_env = [
+                        self.current_episode_id + i for i in range(step_batch_size)
+                    ]
+                    self.current_episode_id += step_batch_size
+                elif len(self.current_trajectory_per_env) != step_batch_size:
+                    old_size = len(self.current_trajectory_per_env)
+                    if step_batch_size > old_size:
+                        for _ in range(old_size, step_batch_size):
+                            self.current_trajectory_per_env.append([])
+                            self.current_episode_id_per_env.append(
+                                self.current_episode_id
+                            )
+                            self.current_episode_id += 1
+                    else:
+                        self.current_trajectory_per_env = (
+                            self.current_trajectory_per_env[:step_batch_size]
+                        )
+                        self.current_episode_id_per_env = (
+                            self.current_episode_id_per_env[:step_batch_size]
+                        )
+                for i in range(step_batch_size):
+                    obs_i = {key: np.squeeze(val[i]) for key, val in step_obs.items()}
+                    next_obs_i = {
+                        key: np.squeeze(val[i]) for key, val in step_next_obs.items()
+                    }
+
+                    transition = Transition(
+                        observation=obs_i,
+                        action=step_actions[i],
+                        reward=float(step_rewards[i]),
+                        next_observation=next_obs_i,
+                        terminated=bool(step_terminations[i]),
+                        truncated=bool(step_truncations[i])
+                        if step_truncations is not None
+                        else False,
+                        info=step_infos_list[i],
+                        episode_id=self.current_episode_id_per_env[i],
+                    )
+
+                    self.current_trajectory_per_env[i].append(transition)
+
+                    episode_ended = transition.terminated or transition.truncated
+                    if episode_ended:
+                        if len(self.current_trajectory_per_env[i]) > 0:
+                            self._add_trajectory(self.current_trajectory_per_env[i])
+                            self.current_trajectory_per_env[i] = []
+                        self.current_episode_id_per_env[i] = self.current_episode_id
+                        self.current_episode_id += 1
+
+        if rewards.ndim == 2:
+            time_len, _ = rewards.shape
+            for t in range(time_len):
+                step_infos = infos[t] if isinstance(infos, (list, tuple)) else infos
+                step_trunc = truncations[t] if truncations is not None else None
+                _add_step(
+                    {k: v[t] for k, v in obs.items()},
+                    {k: v[t] for k, v in next_obs.items()},
+                    actions[t],
+                    rewards[t],
+                    terminations[t],
+                    step_infos,
+                    step_trunc,
                 )
-                
-                self.current_trajectory.append(transition)
-                
-                # Check if episode ended
-                episode_ended = transition.terminated or transition.truncated
-                
-                if episode_ended:
-                    # Save current trajectory
-                    if len(self.current_trajectory) > 0:
-                        self._add_trajectory(self.current_trajectory)
-                        self.current_trajectory = []
-                    self.current_episode_id += 1
         else:
-            if (
-                self.current_trajectory_per_env is None
-                or self.current_episode_id_per_env is None
-                or len(self.current_trajectory_per_env) != batch_size
-            ):
-                self.current_trajectory_per_env = [[] for _ in range(batch_size)]
-                self.current_episode_id_per_env = [
-                    self.current_episode_id + i for i in range(batch_size)
-                ]
-                self.current_episode_id += batch_size
-            for i in range(batch_size):
-                obs_i = {key: np.squeeze(val[i]) for key, val in obs.items()}
-                next_obs_i = {key: np.squeeze(val[i]) for key, val in next_obs.items()}
-
-                transition = Transition(
-                    observation=obs_i,
-                    action=actions[i],
-                    reward=float(rewards[i]),
-                    next_observation=next_obs_i,
-                    terminated=bool(terminations[i]),
-                    truncated=bool(truncations[i]) if truncations is not None else False,
-                    info=infos_list[i],
-                    episode_id=self.current_episode_id_per_env[i],
-                )
-
-                self.current_trajectory_per_env[i].append(transition)
-
-                episode_ended = transition.terminated or transition.truncated
-                if episode_ended:
-                    if len(self.current_trajectory_per_env[i]) > 0:
-                        self._add_trajectory(self.current_trajectory_per_env[i])
-                        self.current_trajectory_per_env[i] = []
-                    self.current_episode_id_per_env[i] = self.current_episode_id
-                    self.current_episode_id += 1
+            _add_step(obs, next_obs, actions, rewards, terminations, infos, truncations)
     
     def _add_trajectory(self, trajectory: List[Transition]):
         """Add a complete trajectory to the buffer."""
