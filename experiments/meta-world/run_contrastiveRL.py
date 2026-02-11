@@ -64,21 +64,21 @@ class Args:
     """Evaluate the agent in determinstic mode every X timesteps"""
     num_evals: int = 10
     """Number of times to evaluate the agent"""
-    num_envs: int = 4
+    num_envs: int = 64
     """number of parallel environments"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 10000000
     """total timesteps of the experiments"""
-    buffer_size: int = int(1e6)
-    """the replay memory buffer size"""
-    batch_size: int = 128
+    buffer_size: int = int(5e3)
+    """the replay memory buffer size (in terms of trajectories)"""
+    batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 50000
+    learning_starts: int = 500000
     """timestep to start learning"""
-    random_actions_end: int = 50000
+    random_actions_end: int = 500000
     """timesteps to take actions randomly"""
     policy_lr: float = 1e-3
     """the learning rate of the policy network optimizer"""
-    q_lr: float = 1e-3
+    q_lr: float = 3e-4
     """the learning rate of the contrastive encoders"""
     alpha: float = 0.2
     """entropy regularization coefficient"""
@@ -105,11 +105,11 @@ class Args:
     """update contrastive loss every N steps"""
     nce_start: int = 5_000
     """global step to start contrastive updates"""
-    unroll_length: int = 1
+    unroll_length: int = 50
     """number of env steps to collect per insert"""
     nce_episodes_per_update: int = 64
     """number of trajectories to sample for dense relabeling"""
-    max_per_episode_in_minibatch: int = 2
+    max_per_episode_in_minibatch: int = 1
     """cap on samples per episode per minibatch"""
     goal_bank_size: int = 8192
     """FIFO goal bank capacity (goal embeddings)"""
@@ -117,7 +117,7 @@ class Args:
     """steps before using goal bank (0 = no warmup)"""
     target_utd: float = 0.045
     """target updates-to-data ratio (SGD steps per env step)"""
-    max_update_budget: int = 10
+    max_update_budget: int = 400 #10
     """cap on accumulated SGD steps to prevent bursts"""
     logsumexp_penalty_coeff: float = 1e-3
     """logsumexp regularization coefficient for critic loss"""
@@ -274,7 +274,7 @@ def make_episode_mixed_minibatches(
 
 
 LOG_STD_MAX = 2
-LOG_STD_MIN = -20
+LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
@@ -728,9 +728,7 @@ if __name__ == "__main__":
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(
-            torch.Tensor(envs.single_action_space.shape).to(device)
-        ).item()
+        target_entropy = -0.5 * act_dim
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
@@ -760,7 +758,8 @@ if __name__ == "__main__":
     def update_actor(state, goals_pos, global_step):
         def actor_loss(policy_input):
             pi, log_pi, _ = actor.get_action(policy_input)
-            phi_pi = phi_encoder(state, pi)
+            with torch.no_grad():
+                phi_pi = phi_encoder(state, pi)
             psi_goal = psi_encoder(goals_pos).detach()
             qf_pi = -torch.sqrt(torch.sum((phi_pi - psi_goal) ** 2, dim=-1))
             entropy_loss = (alpha_state["value"] * log_pi).mean()
@@ -825,7 +824,7 @@ if __name__ == "__main__":
         distances = torch.norm(phi_expanded - psi_expanded, dim=2)  # [batch_size, batch_size+Q]
         logits = -distances / args.nce_temperature
 
-        logsumexp = torch.logsumexp(logits, dim=1)
+        logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
         batch_size = logits.shape[0]
         pos_logits = logits[:, :batch_size].diag()
         nce_loss = -(pos_logits - logsumexp).mean()

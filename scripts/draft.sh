@@ -3,8 +3,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1           
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=16GB
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=32GB
 #SBATCH --partition=nvidia
 #SBATCH --array=0
 #SBATCH --output=/scratch/yd2247/cka_rl/logs/%A.out
@@ -83,7 +83,7 @@ cd /scratch/yd2247/cka_rl/experiments/meta-world
 
 python run_experiments_crl.py \
     --algorithm simple \
-    --tag 1e6_timesteps \
-    --seed 20 \
+    --tag 3e-4lr \
+    --seed 7 \
     --track \
     --task-id 3
